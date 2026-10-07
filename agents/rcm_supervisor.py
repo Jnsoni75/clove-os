@@ -1,18 +1,19 @@
 """
-agents/rcm_supervisor.py - Multi-Agent RCM Denial Resolution Architecture
+agents/rcm_supervisor.py - Multi-Agent RCM Denial Resolution via LangGraph
 
-Implements the LangGraph Supervisor Pattern for dental claim denial resolution:
-1. SupervisorNode: Ingests denial payloads from Open Dental, checks semantic cache,
-   routes tasks to worker agents, and aggregates state.
-2. ClinicalRAGWorker: Queries payer policy knowledge bases (Delta Dental, MetLife, Cigna,
-   Guardian) and extracts corroborating clinical proof from doctor chart notes.
-3. AppealWriterWorker: Synthesizes ADA-compliant, evidence-backed appeal letters citing
-   exact clinical measurements, tooth numbers, and Prompt Pay statutory rules.
-4. HITLApproval: Enforces Human-in-the-Loop validation barrier before committing
+Implements an enterprise StateGraph supervisor pattern powered by LangGraph:
+1. SupervisorNode (StateGraph Entry): Ingests denial payloads from Open Dental, checks
+   in-memory semantic cache, and dynamically routes between warm fast-path and cold worker subgraphs.
+2. ClinicalRAGWorker (Worker Node): Queries payer policy knowledge bases (Delta Dental,
+   MetLife, Cigna, Guardian) and extracts clinical proof from contemporaneous doctor chart notes.
+3. AppealWriterWorker (Worker Node): Synthesizes ADA-compliant, evidence-backed appeal letters
+   citing exact clinical measurements, tooth numbers, and Prompt Pay statutory rules.
+4. ObservabilityHarness (Eval Node): Executes live RAGAS evaluation checks and hallucination guards.
+5. HITLApprovalBarrier (Approval Gate): Enforces Human-in-the-Loop review before committing
    audit records to Open Dental eConnector.
 
 HIPAA Safeguards:
-- Stateless execution with zero data retention.
+- Stateless execution with zero data retention (ZDR).
 - Zero patient PHI transmitted to untrusted external endpoints.
 - All doctor chart notes accessed read-only in memory.
 """
@@ -22,14 +23,15 @@ from typing import Dict, List, Optional, Any, Tuple
 from pydantic import BaseModel, Field
 from datetime import datetime
 
+from langgraph.graph import StateGraph, START, END
+
 from integrations.mock_apis import DentalClaim, ClinicalChart, OpenDentalClient
 from cache.token_optimizer import SemanticCache, PromptCacheCostCalculator
 from eval.observability import RagasEvaluator
 
 
-
 # ==========================================
-# Workflow State Schema (LangGraph Pattern)
+# Workflow State Schema (LangGraph State)
 # ==========================================
 
 class ExecutionStepTrace(BaseModel):
@@ -249,7 +251,6 @@ Date of Service: {dos}
 Billed Amount: {billed_fee}
 Denial Code Cited: {claim.denial_code} — {claim.denial_description}
 Contested Procedure Line: CDT {proc_code} ({proc_desc}) | Tooth/Site: {tooth}
-
 Treating Provider: {provider_name} (NPI: {provider_npi})
 
 Dear Dental Claims Review Committee,
@@ -267,7 +268,7 @@ Reviewing the contemporaneous progress notes authored by {provider_name}:
 {evidence_quotes}
 
 Doctor's Detailed Operative Narrative:
-"{chart_notes}"
+\"{chart_notes}\"
 
 3. REGULATORY COMPLIANCE & PROMPT PAY NOTICE:
 The procedures billed represent non-inclusive, clinically distinct treatment modalities as defined by the American Dental Association (ADA) Code on Dental Procedures and Nomenclature. Withholding payment for services that meet documented criteria constitutes an unjustified coverage restriction.
@@ -287,14 +288,14 @@ Enclosures: Diagnostic Radiographs, Detailed 6-Point Periodontal Charting, Intra
 
 
 # ==========================================
-# Supervisor Node & Orchestration Engine
+# LangGraph Supervisor Node & StateGraph Engine
 # ==========================================
 
 class SupervisorNode:
     """
-    Supervisor Node modeling the LangGraph Supervisor Pattern.
-    Orchestrates workers, checks semantic cache, computes prompt cache savings,
-    and enforces HITL barriers.
+    Supervisor Node orchestrating the LangGraph StateGraph workflow for RCM denial resolution.
+    Connects SupervisorNode, ClinicalRAGWorker, AppealWriterWorker, ObservabilityHarness,
+    and HITLApprovalBarrier.
     """
 
     def __init__(
@@ -309,191 +310,242 @@ class SupervisorNode:
         self.writer_worker = AppealWriterWorker()
         self.ragas_evaluator = ragas_evaluator or RagasEvaluator()
 
+        # Build and compile LangGraph StateGraph
+        self.workflow_graph = self._build_langgraph()
+        self.compiled_app = self.workflow_graph.compile()
+
+    def _build_langgraph(self) -> StateGraph:
+        """Constructs the LangGraph StateGraph with conditional fast-path cache routing."""
+        builder = StateGraph(RCMWorkflowState)
+
+        # -----------------------------------------------------------------
+        # Node 1: Supervisor Node Inspection
+        # -----------------------------------------------------------------
+        def supervisor_node_fn(state: RCMWorkflowState) -> Dict[str, Any]:
+            step_start = time.perf_counter()
+            primary_proc = state.claim.procs[0].proc_code if state.claim.procs else "D2950"
+            cache_query = f"Payer {state.claim.payer_name} denied CDT {primary_proc} code {state.claim.denial_code} {state.claim.denial_description}"
+
+            cache_res = self.semantic_cache.lookup(cache_query)
+            step_latency = (time.perf_counter() - step_start) * 1000.0
+
+            if cache_res.is_hit:
+                # Fast path cached resolution
+                cost_metrics = self.cost_calculator.record_transaction(
+                    prompt_prefix_tokens=3200,
+                    dynamic_tokens=150,
+                    output_tokens=620,
+                    is_cached_prefix=True
+                )
+                t1 = ExecutionStepTrace(
+                    step_id="STEP-1-CACHE",
+                    node_name="SupervisorNode",
+                    action="Semantic Cache Lookup",
+                    latency_ms=round(cache_res.latency_ms, 2),
+                    input_tokens=0,
+                    output_tokens=0,
+                    cached=True,
+                    status="CACHE_HIT",
+                    details=f"Cosine similarity: {cache_res.similarity_score:.4f} >= 0.90 threshold. Retrieved cached appeal instantly at $0 LLM compute cost."
+                )
+                t2 = ExecutionStepTrace(
+                    step_id="STEP-2-ROUTING",
+                    node_name="SupervisorNode",
+                    action="Fast-Path Cache Dispatch",
+                    latency_ms=round(step_latency, 2),
+                    input_tokens=0,
+                    output_tokens=0,
+                    cached=True,
+                    status="SUCCESS",
+                    details="Bypassed downstream workers (RAG & Writer). Delivered verified pre-cached appeal directly to HITL verification queue."
+                )
+                return {
+                    "cache_hit": True,
+                    "appeal_letter": cache_res.cached_content,
+                    "financial_savings": cost_metrics,
+                    "traces": state.traces + [t1, t2]
+                }
+            else:
+                assessment = {
+                    "denial_category": "Medical Necessity / Lack of Evidence" if state.claim.denial_code in ["CO-50", "CO-16"] else "Bundled Coding",
+                    "primary_proc": primary_proc,
+                    "complexity_level": "High" if len(state.claim.procs) > 1 else "Standard",
+                    "payer_appeal_window_days": 180,
+                    "target_worker": "ClinicalRAGWorker"
+                }
+                t = ExecutionStepTrace(
+                    step_id="STEP-1-INSPECT",
+                    node_name="SupervisorNode",
+                    action="Inspect Denial Payload",
+                    latency_ms=round(step_latency, 2),
+                    input_tokens=450,
+                    output_tokens=120,
+                    cached=False,
+                    status="SUCCESS",
+                    details=f"Identified denial {state.claim.denial_code} on CDT {primary_proc}. Extracted clinical parameters and routed to ClinicalRAGWorker."
+                )
+                return {
+                    "cache_hit": False,
+                    "supervisor_assessment": assessment,
+                    "traces": state.traces + [t]
+                }
+
+        # -----------------------------------------------------------------
+        # Node 2: Clinical RAG Worker
+        # -----------------------------------------------------------------
+        def clinical_rag_fn(state: RCMWorkflowState) -> Dict[str, Any]:
+            step_start = time.perf_counter()
+            findings = self.rag_worker.evaluate(state.claim, state.clinical_chart)
+            step_latency = (time.perf_counter() - step_start) * 1000.0
+
+            t = ExecutionStepTrace(
+                step_id="STEP-2-RAG",
+                node_name="ClinicalRAGWorker",
+                action="Payer Policy & Clinical Chart Retrieval",
+                latency_ms=round(step_latency + 120.0, 2),
+                input_tokens=2100,
+                output_tokens=480,
+                cached=False,
+                status="SUCCESS",
+                details=f"Cross-referenced {findings['policy_section']}. Corroborated {len(findings['criteria_satisfied'])} clinical proofs (Confidence: {findings['clinical_confidence'] * 100:.0f}%)."
+            )
+            return {
+                "rag_findings": findings,
+                "traces": state.traces + [t]
+            }
+
+        # -----------------------------------------------------------------
+        # Node 3: Appeal Writer Worker
+        # -----------------------------------------------------------------
+        def appeal_writer_fn(state: RCMWorkflowState) -> Dict[str, Any]:
+            step_start = time.perf_counter()
+            appeal_letter = self.writer_worker.draft_appeal(state.claim, state.clinical_chart, state.rag_findings)
+            step_latency = (time.perf_counter() - step_start) * 1000.0
+
+            is_cached_prefix = (state.claim.claim_id % 2 == 0)
+            cost_metrics = self.cost_calculator.record_transaction(
+                prompt_prefix_tokens=2800,
+                dynamic_tokens=420,
+                output_tokens=680,
+                is_cached_prefix=is_cached_prefix
+            )
+
+            primary_proc = state.claim.procs[0].proc_code if state.claim.procs else "D2950"
+            cache_query = f"Payer {state.claim.payer_name} denied CDT {primary_proc} code {state.claim.denial_code} {state.claim.denial_description}"
+            self.semantic_cache.put(cache_query, appeal_letter, {"cdt_code": primary_proc, "payer": state.claim.payer_name})
+
+            t = ExecutionStepTrace(
+                step_id="STEP-3-WRITER",
+                node_name="AppealWriterWorker",
+                action="Synthesize ADA-Compliant Appeal Letter",
+                latency_ms=round(step_latency + 240.0, 2),
+                input_tokens=3220,
+                output_tokens=680,
+                cached=is_cached_prefix,
+                status="SUCCESS",
+                details=f"Drafted formal appeal citing doctor quotes and Prompt Pay statute. Prefix Cache Read: {'HIT (90% discount)' if is_cached_prefix else 'MISS (Cache write)'}."
+            )
+            return {
+                "appeal_letter": appeal_letter,
+                "financial_savings": cost_metrics,
+                "traces": state.traces + [t]
+            }
+
+        # -----------------------------------------------------------------
+        # Node 4: Observability & RAGAS Evaluation Harness
+        # -----------------------------------------------------------------
+        def ragas_eval_fn(state: RCMWorkflowState) -> Dict[str, Any]:
+            policy_sec = state.rag_findings.get("policy_section", "Payer Clinical Coverage Guidelines")
+            ragas_res = self.ragas_evaluator.evaluate(
+                claim=state.claim,
+                chart=state.clinical_chart,
+                appeal_text=state.appeal_letter or "",
+                policy_section=policy_sec
+            )
+            guard_status = "PASSED" if not ragas_res.hallucination_detected else "FLAGGED"
+            t = ExecutionStepTrace(
+                step_id="STEP-4-RAGAS",
+                node_name="ObservabilityHarness",
+                action="RAGAS Faithfulness & Hallucination Guard",
+                latency_ms=45.0,
+                input_tokens=850,
+                output_tokens=60,
+                cached=False,
+                status=guard_status,
+                details=f"Faithfulness: {ragas_res.faithfulness * 100:.1f}%. {ragas_res.reasoning}"
+            )
+            return {
+                "faithfulness_score": ragas_res.faithfulness,
+                "context_precision": ragas_res.context_precision,
+                "answer_relevancy": ragas_res.answer_relevancy,
+                "traces": state.traces + [t]
+            }
+
+        # -----------------------------------------------------------------
+        # Node 5: Human-in-the-Loop Barrier
+        # -----------------------------------------------------------------
+        def hitl_barrier_fn(state: RCMWorkflowState) -> Dict[str, Any]:
+            t = ExecutionStepTrace(
+                step_id="STEP-5-HITL",
+                node_name="HITLApprovalBarrier",
+                action="Hold for Clinical Billing Approval",
+                latency_ms=5.0,
+                input_tokens=0,
+                output_tokens=0,
+                cached=False,
+                status="BLOCKED_HITL",
+                details="Execution paused at verification barrier. Awaiting licensed dentist or certified billing specialist authorization before Open Dental commit."
+            )
+            return {
+                "hitl_status": "PENDING_REVIEW",
+                "traces": state.traces + [t]
+            }
+
+        # Register nodes
+        builder.add_node("SupervisorNode", supervisor_node_fn)
+        builder.add_node("ClinicalRAGWorker", clinical_rag_fn)
+        builder.add_node("AppealWriterWorker", appeal_writer_fn)
+        builder.add_node("ObservabilityHarness", ragas_eval_fn)
+        builder.add_node("HITLApprovalBarrier", hitl_barrier_fn)
+
+        # Edges & Conditional Routing
+        builder.add_edge(START, "SupervisorNode")
+
+        def supervisor_router(state: RCMWorkflowState) -> str:
+            if state.cache_hit:
+                return "ObservabilityHarness"
+            return "ClinicalRAGWorker"
+
+        builder.add_conditional_edges(
+            "SupervisorNode",
+            supervisor_router,
+            {
+                "ObservabilityHarness": "ObservabilityHarness",
+                "ClinicalRAGWorker": "ClinicalRAGWorker"
+            }
+        )
+        builder.add_edge("ClinicalRAGWorker", "AppealWriterWorker")
+        builder.add_edge("AppealWriterWorker", "ObservabilityHarness")
+        builder.add_edge("ObservabilityHarness", "HITLApprovalBarrier")
+        builder.add_edge("HITLApprovalBarrier", END)
+
+        return builder
+
     def run(self, claim: DentalClaim, chart: Optional[ClinicalChart]) -> RCMWorkflowState:
         """
-        Executes end-to-end multi-agent resolution for an Open Dental claim denial.
+        Executes end-to-end multi-agent resolution using the compiled LangGraph StateGraph.
         """
-        state = RCMWorkflowState(claim_id=claim.claim_id, claim=claim, clinical_chart=chart)
-
-        # -----------------------------------------------------------------
-        # STEP 1: Supervisor Node Inspection & Semantic Cache Interception
-        # -----------------------------------------------------------------
-        step1_start = time.perf_counter()
-        primary_proc = claim.procs[0].proc_code if claim.procs else "D2950"
-        cache_query = f"Payer {claim.payer_name} denied CDT {primary_proc} code {claim.denial_code} {claim.denial_description}"
-
-        cache_result = self.semantic_cache.lookup(cache_query)
-        step1_latency = (time.perf_counter() - step1_start) * 1000.0
-
-        if cache_result.is_hit:
-            state.cache_hit = True
-            state.appeal_letter = cache_result.cached_content
-            
-            # Live RAGAS evaluation on cached appeal against patient chart
-            eval_res = self.ragas_evaluator.evaluate(
-                claim=claim,
-                chart=chart,
-                appeal_text=cache_result.cached_content or "",
-                policy_section="Pre-Verified Payer Policy Manual"
-            )
-            state.faithfulness_score = eval_res.faithfulness
-            state.context_precision = eval_res.context_precision
-            state.answer_relevancy = eval_res.answer_relevancy
-            state.hitl_status = "PENDING_REVIEW"
-
-            # Record in prompt cache calculator with 100% prefix read discount
-            cost_metrics = self.cost_calculator.record_transaction(
-                prompt_prefix_tokens=3200,
-                dynamic_tokens=150,
-                output_tokens=620,
-                is_cached_prefix=True
-            )
-            state.financial_savings = cost_metrics
-
-            state.traces.append(ExecutionStepTrace(
-                step_id="STEP-1-CACHE",
-                node_name="SupervisorNode",
-                action="Semantic Cache Lookup",
-                latency_ms=round(cache_result.latency_ms, 2),
-                input_tokens=0,
-                output_tokens=0,
-                cached=True,
-                status="CACHE_HIT",
-                details=f"Cosine similarity: {cache_result.similarity_score:.4f} >= 0.90 threshold. Retrieved cached appeal instantly at $0 LLM compute cost."
-            ))
-
-            state.traces.append(ExecutionStepTrace(
-                step_id="STEP-2-ROUTING",
-                node_name="SupervisorNode",
-                action="Fast-Path Cache Dispatch",
-                latency_ms=round(step1_latency, 2),
-                input_tokens=0,
-                output_tokens=0,
-                cached=True,
-                status="SUCCESS",
-                details="Bypassed downstream workers (RAG & Writer). Delivered verified pre-cached appeal directly to HITL verification queue."
-            ))
-            return state
-
-        # -----------------------------------------------------------------
-        # STEP 2: Supervisor Denial Payload Analysis & Worker Routing
-        # -----------------------------------------------------------------
-        state.supervisor_assessment = {
-            "denial_category": "Medical Necessity / Lack of Evidence" if claim.denial_code in ["CO-50", "CO-16"] else "Bundled Coding",
-            "primary_proc": primary_proc,
-            "complexity_level": "High" if len(claim.procs) > 1 else "Standard",
-            "payer_appeal_window_days": 180,
-            "target_worker": "ClinicalRAGWorker"
-        }
-
-        state.traces.append(ExecutionStepTrace(
-            step_id="STEP-1-INSPECT",
-            node_name="SupervisorNode",
-            action="Inspect Denial Payload",
-            latency_ms=round(step1_latency, 2),
-            input_tokens=450,
-            output_tokens=120,
-            cached=False,
-            status="SUCCESS",
-            details=f"Identified denial {claim.denial_code} on CDT {primary_proc}. Extracted clinical parameters and routed to ClinicalRAGWorker."
-        ))
-
-        # -----------------------------------------------------------------
-        # STEP 3: Clinical RAG Worker Execution
-        # -----------------------------------------------------------------
-        rag_start = time.perf_counter()
-        rag_findings = self.rag_worker.evaluate(claim, chart)
-        state.rag_findings = rag_findings
-        rag_latency = (time.perf_counter() - rag_start) * 1000.0
-
-        state.traces.append(ExecutionStepTrace(
-            step_id="STEP-2-RAG",
-            node_name="ClinicalRAGWorker",
-            action="Payer Policy & Clinical Chart Retrieval",
-            latency_ms=round(rag_latency + 120.0, 2),  # realistic simulated retrieval latency
-            input_tokens=2100,
-            output_tokens=480,
-            cached=False,
-            status="SUCCESS",
-            details=f"Cross-referenced {rag_findings['policy_section']}. Corroborated {len(rag_findings['criteria_satisfied'])} clinical proofs (Confidence: {rag_findings['clinical_confidence'] * 100:.0f}%)."
-        ))
-
-        # -----------------------------------------------------------------
-        # STEP 4: Appeal Writer Worker Execution
-        # -----------------------------------------------------------------
-        writer_start = time.perf_counter()
-        appeal_letter = self.writer_worker.draft_appeal(claim, chart, rag_findings)
-        state.appeal_letter = appeal_letter
-        writer_latency = (time.perf_counter() - writer_start) * 1000.0
-
-        # Model prompt caching: Prefix is cached across repeated appeals of same payer/procedure
-        is_cached_prefix = (claim.claim_id % 2 == 0)  # Realistic 50-70% prefix caching hit pattern
-        cost_metrics = self.cost_calculator.record_transaction(
-            prompt_prefix_tokens=2800,
-            dynamic_tokens=420,
-            output_tokens=680,
-            is_cached_prefix=is_cached_prefix
-        )
-        state.financial_savings = cost_metrics
-
-        state.traces.append(ExecutionStepTrace(
-            step_id="STEP-3-WRITER",
-            node_name="AppealWriterWorker",
-            action="Synthesize ADA-Compliant Appeal Letter",
-            latency_ms=round(writer_latency + 240.0, 2),
-            input_tokens=3220,
-            output_tokens=680,
-            cached=is_cached_prefix,
-            status="SUCCESS",
-            details=f"Drafted formal appeal citing doctor quotes and Prompt Pay statute. Prefix Cache Read: {'HIT (90% discount)' if is_cached_prefix else 'MISS (Cache write)'}."
-        ))
-
-        # Store generated appeal back in semantic cache for future similar denials
-        self.semantic_cache.put(cache_query, appeal_letter, {"cdt_code": primary_proc, "payer": claim.payer_name})
-
-        # -----------------------------------------------------------------
-        # STEP 5: RAGAS Evaluation Harness Execution
-        # -----------------------------------------------------------------
-        ragas_res = self.ragas_evaluator.evaluate(
+        initial_state = RCMWorkflowState(
+            claim_id=claim.claim_id,
             claim=claim,
-            chart=chart,
-            appeal_text=appeal_letter,
-            policy_section=rag_findings.get("policy_section", "Payer Clinical Coverage Guidelines")
+            clinical_chart=chart
         )
-        state.faithfulness_score = ragas_res.faithfulness
-        state.context_precision = ragas_res.context_precision
-        state.answer_relevancy = ragas_res.answer_relevancy
+        result_dict = self.compiled_app.invoke(initial_state)
+        return RCMWorkflowState.model_validate(result_dict)
 
-        guard_status = "PASSED" if not ragas_res.hallucination_detected else "FLAGGED"
-        state.traces.append(ExecutionStepTrace(
-            step_id="STEP-4-RAGAS",
-            node_name="ObservabilityHarness",
-            action="RAGAS Faithfulness & Hallucination Guard",
-            latency_ms=45.0,
-            input_tokens=850,
-            output_tokens=60,
-            cached=False,
-            status=guard_status,
-            details=f"Faithfulness: {state.faithfulness_score * 100:.1f}%. {ragas_res.reasoning}"
-        ))
-
-        # -----------------------------------------------------------------
-        # STEP 6: Human-in-the-Loop Barrier
-        # -----------------------------------------------------------------
-        state.hitl_status = "PENDING_REVIEW"
-        state.traces.append(ExecutionStepTrace(
-            step_id="STEP-5-HITL",
-            node_name="HITLApprovalBarrier",
-            action="Hold for Clinical Billing Approval",
-            latency_ms=5.0,
-            input_tokens=0,
-            output_tokens=0,
-            cached=False,
-            status="BLOCKED_HITL",
-            details="Execution paused at verification barrier. Awaiting licensed dentist or certified billing specialist authorization before Open Dental commit."
-        ))
-
-        return state
+    def get_graph_mermaid(self) -> str:
+        """Returns Mermaid representation of the LangGraph StateGraph for visualization."""
+        return self.compiled_app.get_graph().draw_mermaid()
 
 
 # ==========================================

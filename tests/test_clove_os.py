@@ -206,6 +206,15 @@ class TestRCMSupervisorWorkflow(unittest.TestCase):
         od_claim = self.od_client.get_claim(90412)
         self.assertEqual(od_claim.status, "AI Review Pending")
 
+    def test_langgraph_stategraph_compilation(self):
+        self.assertIsNotNone(self.supervisor.workflow_graph)
+        self.assertIsNotNone(self.supervisor.compiled_app)
+        mermaid = self.supervisor.get_graph_mermaid()
+        self.assertIn('SupervisorNode', mermaid)
+        self.assertIn('ClinicalRAGWorker', mermaid)
+        self.assertIn('AppealWriterWorker', mermaid)
+
+
 
 if __name__ == "__main__":
     unittest.main()
