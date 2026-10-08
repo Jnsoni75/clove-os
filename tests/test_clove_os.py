@@ -9,7 +9,7 @@ import unittest
 from agents.llm import STATIC_PREFIX, Deidentifier, TemplateDrafter, build_dynamic_prompt
 from agents.rcm_supervisor import RCMDenialAgent
 from agents.retrieval import EvidenceExtractor, PolicyRetriever, split_sentences
-from cache.token_optimizer import (
+from llm_cache.token_optimizer import (
     PHILeakError, PolicyContextCache, PrefixCacheSimulator, PromptCacheEconomics, break_even_reads, estimate_tokens,
 )
 from eval.grounding import GroundingVerifier
