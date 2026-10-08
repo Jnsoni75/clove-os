@@ -3,7 +3,7 @@
 **Role**: AI Operations Associate — Clove Dental  
 **Application Deliverable**: Written Case Study & Technical Architecture Document  
 **Live Repository**: [github.com/Jnsoni75/clove-os](https://github.com/Jnsoni75/clove-os)  
-**Interactive Dashboard**: Running locally on port `8501` / Deployable to Railway  
+**Live Production Deployment**: [https://clove-os.streamlit.app/](https://clove-os.streamlit.app/)  
 
 ---
 

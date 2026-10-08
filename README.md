@@ -1,5 +1,7 @@
 # Clove OS: Autonomous AI Operations Platform for Dental DSOs
 
+🚀 **Live Production Dashboard**: [https://clove-os.streamlit.app/](https://clove-os.streamlit.app/)
+
 **Clove OS** is an enterprise AI operations platform engineered for **Clove Dental**, a 100-office dental support organization (DSO) rollup. It replaces manual, fragmented operational workflows with deterministic, verifiable, and cost-optimized agentic pipelines embedded across Revenue Cycle Management (RCM), Workforce Scheduling (Deputy), M&A Pipeline Sourcing (Zoho CRM), and LLM Observability.
 
 ---
