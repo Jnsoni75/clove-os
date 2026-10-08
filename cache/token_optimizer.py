@@ -1,380 +1,210 @@
 """
-cache/token_optimizer.py - Semantic Vector Caching & Frontier Prompt Economics
+cache/token_optimizer.py - Cost controls for the RCM agent.
 
-This module delivers extreme LLM cost reduction and sub-5ms latency for repetitive
-dental insurance denial workflows across Clove Dental's 100 clinic network.
+Two layers, each placed where caching is actually safe:
 
-Components:
-1. SemanticCache:
-   - In-memory vector cache with cosine similarity matching.
-   - Evaluates similarity between incoming denial query embeddings and cached historical appeals.
-   - If similarity >= 0.90: Returns cached resolution in < 5ms at $0 LLM cost.
-   - If similarity < 0.90: Cache miss, routes to agentic worker orchestration.
+1. PolicyContextCache (application layer)
+   Caches *retrieval results* keyed on (payer_id, CDT, CARC). Values come only from the
+   policy corpus, so they are PHI-free by construction - and `put` enforces that with a
+   guard. We deliberately do NOT cache finished appeal letters: letters are patient-specific,
+   and serving one patient's letter for another's denial is both wrong and a HIPAA breach.
 
-2. PromptCacheCostCalculator:
-   - Implements Anthropic / Frontier prefix prompt caching economics:
-     * Base Input Tokens: $3.00 / 1M tokens ($0.000003 / token)
-     * Cached Input Reads: $0.30 / 1M tokens (90% discount on cache hits)
-     * Cache Write (1st turn prefix ingestion): $3.75 / 1M tokens (25% surcharge)
-     * Output Generation: $15.00 / 1M tokens
-   - Theoretical break-even occurs at 1.39 reads per unique prefix.
-   - Generates real-time financial telemetry for executive reporting.
+2. Anthropic prompt caching (provider layer)
+   The static system prefix (instructions + policy corpus) is byte-identical across claims,
+   so it is marked with cache_control. PromptCacheEconomics prices real `usage` objects from
+   the API. In offline mode, PrefixCacheSimulator decides write vs read from the 5-minute
+   TTL and the minimum cacheable length, and costs are labelled "estimated".
 
-HIPAA Compliance & Zero-Retention Safeguard:
-- Semantic cache keys are normalized representations of payer rules, CDT codes, and
-  sanitized clinical phenotypes.
-- Zero PHI (Protected Health Information) is persisted in the vector index.
-- Patient identifiers (name, MRN, DOB) are scrubbed before computing embeddings.
-- Meets HIPAA Business Associate Agreement (BAA) zero data retention requirements.
+Pricing (Claude Sonnet class, per 1M tokens): input $3.00, output $15.00,
+5-minute cache write $3.75 (1.25x), cache read $0.30 (0.1x). Verify against current
+Anthropic pricing before quoting externally.
 """
 
+from __future__ import annotations
+
+import hashlib
+import json
 import time
-import math
-import re
-from typing import Dict, List, Optional, Tuple, Any
-import numpy as np
-from pydantic import BaseModel, Field
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+# ==========================================
+# Pricing
+# ==========================================
+
+@dataclass(frozen=True)
+class ModelPricing:
+    input_per_m: float = 3.00
+    output_per_m: float = 15.00
+    cache_write_per_m: float = 3.75     # 5-minute TTL write (1.25x)
+    cache_read_per_m: float = 0.30      # 0.1x
+    min_cacheable_tokens: int = 1024    # prefixes shorter than this are not cached
+    cache_ttl_seconds: int = 300
 
 
-class CacheHitResult(BaseModel):
-    is_hit: bool
-    similarity_score: float
-    cached_content: Optional[str] = None
-    matched_query: Optional[str] = None
-    latency_ms: float
-    cost_saved_usd: float
-    cached_metadata: Dict[str, Any] = Field(default_factory=dict)
+SONNET_PRICING = ModelPricing()
 
 
-class PromptCacheMetrics(BaseModel):
-    total_calls: int
-    cache_hits: int
-    cache_misses: int
-    hit_rate_pct: float
-    raw_input_tokens: int
-    cached_read_tokens: int
-    new_input_tokens: int
-    output_tokens: int
-    unoptimized_cost_usd: float
-    optimized_cost_usd: float
-    net_savings_usd: float
-    savings_pct: float
-    break_even_reads: float = 1.39
+def estimate_tokens(text: str) -> int:
+    """~4 chars/token heuristic. Only used in offline mode; live mode uses API usage."""
+    return max(1, len(text) // 4)
 
 
-class SemanticCache:
+def break_even_reads(p: ModelPricing = SONNET_PRICING) -> float:
     """
-    High-performance in-memory vector cache for dental RCM appeals and payer policies.
-    Uses n-gram feature hashing + TF-IDF cosine similarity to deliver deterministic,
-    sub-5ms vector matching without external vector DB dependencies.
+    Reads after the first write at which caching beats no caching:
+        write + N*read  <  (1 + N) * base
+        N > (write - base) / (base - read) = (1.25 - 1) / (1 - 0.1) = 0.28
+    i.e. caching pays for itself on the FIRST cache read.
     """
-
-    def __init__(self, similarity_threshold: float = 0.90, embedding_dim: int = 256):
-        self.similarity_threshold = similarity_threshold
-        self.embedding_dim = embedding_dim
-        # Stored records: query_text, embedding_vector, response_text, metadata
-        self._entries: List[Dict[str, Any]] = []
-        self._total_lookups = 0
-        self._total_hits = 0
-        self._seed_cache()
-
-    def _text_to_vector(self, text: str) -> np.ndarray:
-        """
-        Creates a normalized dense vector embedding using deterministic feature hashing
-        and character/word token frequencies. Avoids bulky external embeddings while
-        providing robust cosine similarity for clinical RCM phrasing.
-        """
-        cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", text.lower())
-        tokens = cleaned.split()
-        vec = np.zeros(self.embedding_dim, dtype=np.float32)
-
-        if not tokens:
-            return vec
-
-        # Bag-of-words + bi-gram hashing
-        for i, token in enumerate(tokens):
-            h1 = hash(token) % self.embedding_dim
-            vec[h1] += 1.5
-            if i < len(tokens) - 1:
-                bigram = f"{token}_{tokens[i+1]}"
-                h2 = hash(bigram) % self.embedding_dim
-                vec[h2] += 2.0
-
-        # Term-frequency sublinear scaling
-        vec = np.log1p(vec)
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec = vec / norm
-        return vec
-
-    def _seed_cache(self):
-        """Pre-seeds semantic cache with validated appeal templates for standard dental denials."""
-        seed_items = [
-            (
-                "Payer Delta Dental denied CDT D2950 core buildup code CO-50 insufficient clinical evidence coronal breakdown",
-                (
-                    "CLINICAL APPEAL JUSTIFICATION FOR D2950 (CORE BUILDUP):\n"
-                    "In accordance with ADA Current Dental Terminology guidelines and Delta Dental Clinical Section 4B criteria, "
-                    "a core buildup (D2950) is clinically required when less than 50% sound coronal tooth structure remains. "
-                    "Operative documentation and intraoral photographs substantiate severe structural breakdown exceeding 50% "
-                    "following deep excavation of recurrent dental caries. Placement of composite resin core with dentin bonding "
-                    "was mandatory to provide retention and ferrule height. Payment is respectfully requested."
-                ),
-                {"cdt_code": "D2950", "denial_code": "CO-50", "payer": "Delta Dental", "evidence_type": "Coronal Loss"}
-            ),
-            (
-                "Payer Delta Dental denied CDT D2950 code CO-50 Medical necessity required >50% coronal breakdown",
-                (
-                    "CLINICAL APPEAL JUSTIFICATION FOR D2950 (CORE BUILDUP):\n"
-                    "In accordance with ADA Current Dental Terminology guidelines and Delta Dental Clinical Section 4B criteria, "
-                    "a core buildup (D2950) is clinically required when less than 50% sound coronal tooth structure remains. "
-                    "Operative documentation and intraoral photographs substantiate severe structural breakdown exceeding 50% "
-                    "following deep excavation of recurrent dental caries. Placement of composite resin core with dentin bonding "
-                    "was mandatory to provide retention and ferrule height. Payment is respectfully requested."
-                ),
-                {"cdt_code": "D2950", "denial_code": "CO-50", "payer": "Delta Dental", "evidence_type": "Coronal Loss"}
-            ),
-            (
-                "MetLife claim denial CO-16 for D4341 periodontal scaling root planing missing 6 point probing depths bone loss",
-                (
-                    "CLINICAL APPEAL FOR D4341 (PERIODONTAL SCALING & ROOT PLANING):\n"
-                    "This appeal contests the CO-16 denial for D4341. Attached diagnostic charting verifies chronic periodontitis "
-                    "with active pocket depths of 5mm to 7mm and bleeding on probing across multiple teeth in the indicated quadrant. "
-                    "Diagnostic bitewing radiographs demonstrate horizontal crestal bone loss exceeding 20-30%, satisfying MetLife "
-                    "Clinical Review Guidelines Section 3.2. Please process for immediate remittance."
-                ),
-                {"cdt_code": "D4341", "denial_code": "CO-16", "payer": "MetLife Dental", "evidence_type": "Perio Charting"}
-            ),
-            (
-                "Cigna bundling denial CO-97 for D2740 porcelain ceramic crown after root canal therapy",
-                (
-                    "CLINICAL APPEAL FOR D2740 (PORCELAIN/CERAMIC CROWN - SEPARATE BENEFIT):\n"
-                    "We dispute the CO-97 bundling denial. The full-coverage crown (D2740) constitutes an independent, definitive "
-                    "prosthodontic restoration following endodontic therapy. Due to significant cuspal undermining, definitive crown "
-                    "coverage is required to prevent catastrophic vertical root fracture. Per ADA coding guidelines, D2740 is a distinct "
-                    "billable event not inclusive to provisional post-endo care."
-                ),
-                {"cdt_code": "D2740", "denial_code": "CO-97", "payer": "Cigna Dental", "evidence_type": "Prosthodontic Necessity"}
-            )
-        ]
-
-        for query, resp, meta in seed_items:
-            self.put(query, resp, meta)
-
-    def lookup(self, query: str) -> CacheHitResult:
-        """
-        Queries the semantic cache.
-        Returns a CacheHitResult with execution latency and match metrics.
-        """
-        start_time = time.perf_counter()
-        self._total_lookups += 1
-
-        if not self._entries:
-            latency_ms = (time.perf_counter() - start_time) * 1000.0
-            return CacheHitResult(
-                is_hit=False,
-                similarity_score=0.0,
-                latency_ms=round(latency_ms, 2),
-                cost_saved_usd=0.0
-            )
-
-        query_vec = self._text_to_vector(query)
-        best_sim = -1.0
-        best_entry = None
-
-        for entry in self._entries:
-            sim = float(np.dot(query_vec, entry["vector"]))
-            if sim > best_sim:
-                best_sim = sim
-                best_entry = entry
-
-        latency_ms = (time.perf_counter() - start_time) * 1000.0
-
-        if best_sim >= self.similarity_threshold and best_entry is not None:
-            self._total_hits += 1
-            # Model standard appeal generation token cost (~3,500 input + 650 output tokens = ~$0.0202)
-            estimated_llm_cost = 0.0202
-            return CacheHitResult(
-                is_hit=True,
-                similarity_score=round(best_sim, 4),
-                cached_content=best_entry["response"],
-                matched_query=best_entry["query"],
-                latency_ms=round(latency_ms, 2),
-                cost_saved_usd=estimated_llm_cost,
-                cached_metadata=best_entry["metadata"]
-            )
-
-        return CacheHitResult(
-            is_hit=False,
-            similarity_score=round(max(0.0, best_sim), 4),
-            matched_query=best_entry["query"] if best_entry else None,
-            latency_ms=round(latency_ms, 2),
-            cost_saved_usd=0.0
-        )
-
-    def put(self, query: str, response: str, metadata: Optional[Dict[str, Any]] = None):
-        """Adds a newly resolved query and generated appeal to the semantic vector cache."""
-        vec = self._text_to_vector(query)
-        self._entries.append({
-            "query": query,
-            "vector": vec,
-            "response": response,
-            "metadata": metadata or {},
-            "timestamp": time.time()
-        })
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Returns runtime performance statistics."""
-        hit_rate = (self._total_hits / self._total_lookups * 100.0) if self._total_lookups > 0 else 68.0
-        return {
-            "total_entries": len(self._entries),
-            "total_lookups": self._total_lookups,
-            "total_hits": self._total_hits,
-            "hit_rate_pct": round(hit_rate, 1),
-            "similarity_threshold": self.similarity_threshold,
-            "average_latency_ms": 1.84
-        }
+    base, w, r = p.input_per_m, p.cache_write_per_m, p.cache_read_per_m
+    return round((w - base) / (base - r), 3)
 
 
-class PromptCacheCostCalculator:
-    """
-    Financial modeling engine for Anthropic / Frontier prefix prompt caching.
-    
-    Pricing model:
-    - Base input token price: $3.00 / 1,000,000 tokens ($0.000003/token)
-    - Cached read token price: $0.30 / 1,000,000 tokens (90% discount, $0.0000003/token)
-    - Cache write token price: $3.75 / 1,000,000 tokens (25% initial surcharge)
-    - Output token price: $15.00 / 1,000,000 tokens ($0.000015/token)
-    """
+# ==========================================
+# Layer 1: PHI-safe retrieval cache
+# ==========================================
 
-    PRICE_BASE_INPUT = 3.00 / 1_000_000
-    PRICE_CACHED_INPUT = 0.30 / 1_000_000
-    PRICE_CACHE_WRITE = 3.75 / 1_000_000
-    PRICE_OUTPUT = 15.00 / 1_000_000
-    BREAK_EVEN_READS = 1.39
+class PHILeakError(RuntimeError):
+    pass
 
+
+class PolicyContextCache:
     def __init__(self):
-        self.total_calls = 0
-        self.cache_hits = 0
-        self.cache_misses = 0
-        self.total_raw_tokens = 0
-        self.total_cached_read_tokens = 0
-        self.total_new_input_tokens = 0
-        self.total_output_tokens = 0
+        self._store: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
+        self.hits = 0
+        self.misses = 0
 
-    def record_transaction(
-        self,
-        prompt_prefix_tokens: int,
-        dynamic_tokens: int,
-        output_tokens: int,
-        is_cached_prefix: bool
-    ) -> Dict[str, float]:
-        """
-        Records a single LLM transaction and calculates exact costs.
-        """
-        self.total_calls += 1
-        self.total_raw_tokens += (prompt_prefix_tokens + dynamic_tokens)
-        self.total_output_tokens += output_tokens
+    @staticmethod
+    def key(payer_id: str, cdt: str, carc: str) -> Tuple[str, str, str]:
+        return (payer_id.upper(), cdt.upper(), carc)
 
-        # Unoptimized: standard API calls pay full base input rate on every turn
-        unoptimized_cost = (
-            (prompt_prefix_tokens + dynamic_tokens) * self.PRICE_BASE_INPUT +
-            output_tokens * self.PRICE_OUTPUT
-        )
+    def get(self, key: Tuple[str, str, str]) -> Optional[List[Dict[str, Any]]]:
+        val = self._store.get(key)
+        if val is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        return val
 
-        if is_cached_prefix:
-            self.cache_hits += 1
-            self.total_cached_read_tokens += prompt_prefix_tokens
-            self.total_new_input_tokens += dynamic_tokens
-            optimized_cost = (
-                prompt_prefix_tokens * self.PRICE_CACHED_INPUT +
-                dynamic_tokens * self.PRICE_BASE_INPUT +
-                output_tokens * self.PRICE_OUTPUT
-            )
-        else:
-            self.cache_misses += 1
-            self.total_new_input_tokens += (prompt_prefix_tokens + dynamic_tokens)
-            optimized_cost = (
-                prompt_prefix_tokens * self.PRICE_CACHE_WRITE +
-                dynamic_tokens * self.PRICE_BASE_INPUT +
-                output_tokens * self.PRICE_OUTPUT
-            )
+    def put(self, key: Tuple[str, str, str], value: List[Dict[str, Any]], forbidden_terms: List[str]):
+        blob = json.dumps(value).lower()
+        leaked = [t for t in forbidden_terms if t and str(t).lower() in blob]
+        if leaked:
+            raise PHILeakError(f"Refusing to cache value containing patient identifiers: {leaked}")
+        self._store[key] = value
 
-        savings = max(0.0, unoptimized_cost - optimized_cost)
-
+    def stats(self) -> Dict[str, Any]:
+        total = self.hits + self.misses
         return {
-            "unoptimized_cost_usd": unoptimized_cost,
-            "optimized_cost_usd": optimized_cost,
-            "net_savings_usd": savings,
-            "discount_pct": ((unoptimized_cost - optimized_cost) / unoptimized_cost * 100.0) if unoptimized_cost > 0 else 0.0,
-            "break_even_reads": self.BREAK_EVEN_READS
+            "entries": len(self._store),
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate_pct": round(self.hits / total * 100, 1) if total else 0.0,
         }
 
-    def get_metrics(self) -> PromptCacheMetrics:
-        """Alias for get_summary_metrics."""
-        return self.get_summary_metrics()
 
-    def get_summary_metrics(self) -> PromptCacheMetrics:
-        """Returns aggregate savings metrics and ROI calculations."""
-        # Baseline simulation values if initialized fresh
-        calls = max(1, self.total_calls)
-        hits = self.cache_hits
-        misses = self.cache_misses
+# ==========================================
+# Layer 2: prompt-cache economics
+# ==========================================
 
-        # If zero calls logged, provide standard clinic baseline
-        if self.total_calls == 0:
-            calls = 1420
-            hits = 965
-            misses = 455
-            raw_tokens = 4_970_000
-            cached_tokens = 3_377_500
-            new_tokens = 1_592_500
-            out_tokens = 852_000
-            unopt = (raw_tokens * self.PRICE_BASE_INPUT) + (out_tokens * self.PRICE_OUTPUT)
-            opt = (
-                (cached_tokens * self.PRICE_CACHED_INPUT) +
-                (new_tokens * self.PRICE_BASE_INPUT) +
-                (out_tokens * self.PRICE_OUTPUT)
-            )
-            net_sav = unopt - opt
-            sav_pct = (net_sav / unopt) * 100.0
-            return PromptCacheMetrics(
-                total_calls=calls,
-                cache_hits=hits,
-                cache_misses=misses,
-                hit_rate_pct=round((hits / calls) * 100.0, 1),
-                raw_input_tokens=raw_tokens,
-                cached_read_tokens=cached_tokens,
-                new_input_tokens=new_tokens,
-                output_tokens=out_tokens,
-                unoptimized_cost_usd=round(unopt, 2),
-                optimized_cost_usd=round(opt, 2),
-                net_savings_usd=round(net_sav, 2),
-                savings_pct=round(sav_pct, 1),
-                break_even_reads=self.BREAK_EVEN_READS
-            )
+def _cost(usage: Dict[str, int], p: ModelPricing) -> Tuple[float, float]:
+    """Returns (actual_cost, no_cache_counterfactual) for one Anthropic usage object."""
+    inp = usage.get("input_tokens", 0)
+    cw = usage.get("cache_creation_input_tokens", 0)
+    cr = usage.get("cache_read_input_tokens", 0)
+    out = usage.get("output_tokens", 0)
+    actual = (inp * p.input_per_m + cw * p.cache_write_per_m + cr * p.cache_read_per_m
+              + out * p.output_per_m) / 1e6
+    counterfactual = ((inp + cw + cr) * p.input_per_m + out * p.output_per_m) / 1e6
+    return actual, counterfactual
 
-        unopt = (self.total_raw_tokens * self.PRICE_BASE_INPUT) + (self.total_output_tokens * self.PRICE_OUTPUT)
-        opt = (
-            (self.total_cached_read_tokens * self.PRICE_CACHED_INPUT) +
-            (self.total_new_input_tokens * self.PRICE_BASE_INPUT) +
-            (self.total_output_tokens * self.PRICE_OUTPUT)
-        )
-        net_sav = max(0.0, unopt - opt)
-        sav_pct = (net_sav / unopt * 100.0) if unopt > 0 else 0.0
 
-        return PromptCacheMetrics(
-            total_calls=self.total_calls,
-            cache_hits=self.cache_hits,
-            cache_misses=self.cache_misses,
-            hit_rate_pct=round((self.cache_hits / self.total_calls) * 100.0, 1),
-            raw_input_tokens=self.total_raw_tokens,
-            cached_read_tokens=self.total_cached_read_tokens,
-            new_input_tokens=self.total_new_input_tokens,
-            output_tokens=self.total_output_tokens,
-            unoptimized_cost_usd=round(unopt, 2),
-            optimized_cost_usd=round(opt, 2),
-            net_savings_usd=round(net_sav, 2),
-            savings_pct=round(sav_pct, 1),
-            break_even_reads=self.BREAK_EVEN_READS
-        )
+class PromptCacheEconomics:
+    def __init__(self, pricing: ModelPricing = SONNET_PRICING):
+        self.p = pricing
+        self.calls: List[Dict[str, Any]] = []
+
+    def record(self, usage: Dict[str, int], source: str) -> Dict[str, Any]:
+        """source: 'measured' (real API usage) or 'estimated' (offline simulation)."""
+        actual, counterfactual = _cost(usage, self.p)
+        row = {**usage, "source": source, "cost_usd": actual, "no_cache_cost_usd": counterfactual,
+               "saved_usd": counterfactual - actual}
+        self.calls.append(row)
+        return row
+
+    def summary(self) -> Dict[str, Any]:
+        n = len(self.calls)
+        tot = lambda k: sum(c.get(k, 0) for c in self.calls)  # noqa: E731
+        cost, base = tot("cost_usd"), tot("no_cache_cost_usd")
+        sources = {c["source"] for c in self.calls}
+        return {
+            "calls": n,
+            "source": "measured" if sources == {"measured"} else ("estimated" if sources else "n/a"),
+            "cache_reads": sum(1 for c in self.calls if c.get("cache_read_input_tokens", 0) > 0),
+            "cache_writes": sum(1 for c in self.calls if c.get("cache_creation_input_tokens", 0) > 0),
+            "input_tokens": tot("input_tokens"),
+            "cache_read_tokens": tot("cache_read_input_tokens"),
+            "cache_write_tokens": tot("cache_creation_input_tokens"),
+            "output_tokens": tot("output_tokens"),
+            "cost_usd": round(cost, 6),
+            "no_cache_cost_usd": round(base, 6),
+            "saved_usd": round(base - cost, 6),
+            "saved_pct": round((base - cost) / base * 100, 1) if base else 0.0,
+            "break_even_reads": break_even_reads(self.p),
+        }
+
+    def project_monthly(self, denials_per_month: int, llm_calls_per_denial: float, prefix_tokens: int,
+                        dynamic_tokens: int, output_tokens: int, cache_read_share: float) -> Dict[str, float]:
+        """
+        Scenario model (inputs are assumptions, shown in the UI). cache_read_share is the share
+        of calls that land within the TTL of a prior call with the same prefix - in a centralized
+        RCM team working a queue in batches this is high; for sporadic traffic it is low.
+        """
+        calls = denials_per_month * llm_calls_per_denial
+        cacheable = prefix_tokens >= self.p.min_cacheable_tokens
+        share = cache_read_share if cacheable else 0.0
+        reads, writes = calls * share, calls * (1 - share)
+        per_m = 1e6
+        base = calls * ((prefix_tokens + dynamic_tokens) * self.p.input_per_m
+                        + output_tokens * self.p.output_per_m) / per_m
+        if cacheable:
+            cached = (writes * prefix_tokens * self.p.cache_write_per_m
+                      + reads * prefix_tokens * self.p.cache_read_per_m
+                      + calls * dynamic_tokens * self.p.input_per_m
+                      + calls * output_tokens * self.p.output_per_m) / per_m
+        else:
+            cached = base
+        return {
+            "calls": round(calls),
+            "prefix_cacheable": cacheable,
+            "no_cache_usd": round(base, 2),
+            "with_cache_usd": round(cached, 2),
+            "saved_usd": round(base - cached, 2),
+            "saved_pct": round((base - cached) / base * 100, 1) if base else 0.0,
+            "cost_per_denial_usd": round(cached / denials_per_month, 4) if denials_per_month else 0.0,
+        }
+
+
+class PrefixCacheSimulator:
+    """Offline stand-in for Anthropic's prefix cache: TTL refresh on hit, min length rule."""
+
+    def __init__(self, pricing: ModelPricing = SONNET_PRICING, clock=time.monotonic):
+        self.p = pricing
+        self._clock = clock
+        self._last_used: Dict[str, float] = {}
+
+    def usage_for(self, prefix: str, dynamic: str, output: str) -> Dict[str, int]:
+        pt, dt, ot = estimate_tokens(prefix), estimate_tokens(dynamic), estimate_tokens(output)
+        if pt < self.p.min_cacheable_tokens:
+            return {"input_tokens": pt + dt, "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0, "output_tokens": ot}
+        h = hashlib.sha256(prefix.encode()).hexdigest()
+        now = self._clock()
+        last = self._last_used.get(h)
+        self._last_used[h] = now
+        if last is not None and now - last <= self.p.cache_ttl_seconds:
+            return {"input_tokens": dt, "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": pt, "output_tokens": ot}
+        return {"input_tokens": dt, "cache_creation_input_tokens": pt,
+                "cache_read_input_tokens": 0, "output_tokens": ot}

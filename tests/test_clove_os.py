@@ -1,219 +1,232 @@
 """
-tests/test_clove_os.py - Comprehensive Unit & Integration Test Suite for Clove OS
+tests/test_clove_os.py - Behavioural tests. Each test encodes a property a payer, auditor
+or RCM lead would care about, not just "returns something".
 """
 
+import re
 import unittest
-import numpy as np
-from integrations.mock_apis import (
-    OpenDentalClient,
-    DeputyClient,
-    ZohoClient,
-    DentalClaim,
-    ClinicalChart
-)
+
+from agents.llm import STATIC_PREFIX, Deidentifier, TemplateDrafter, build_dynamic_prompt
+from agents.rcm_supervisor import RCMDenialAgent
+from agents.retrieval import EvidenceExtractor, PolicyRetriever, split_sentences
 from cache.token_optimizer import (
-    SemanticCache,
-    PromptCacheCostCalculator,
-    CacheHitResult,
-    PromptCacheMetrics
+    PHILeakError, PolicyContextCache, PrefixCacheSimulator, PromptCacheEconomics, break_even_reads, estimate_tokens,
 )
-from eval.observability import (
-    RagasEvaluator,
-    LangSmithTracer,
-    RagasMetricScore,
-    TelemetrySpan
-)
-from agents.rcm_supervisor import (
-    SupervisorNode,
-    ClinicalRAGWorker,
-    AppealWriterWorker,
-    HITLApproval,
-    RCMWorkflowState
-)
+from eval.grounding import GroundingVerifier
+from eval.observability import run_golden_eval
+from integrations.mock_apis import DeputyClient, OpenDentalClient, ZohoClient
+from knowledge.rcm_reference import Route, parse_adjustment_code
 
 
-class TestMockApis(unittest.TestCase):
+def agent_and_od():
+    od = OpenDentalClient()
+    return RCMDenialAgent(od, drafter=TemplateDrafter()), od
+
+
+class TestTriage(unittest.TestCase):
     def setUp(self):
-        self.od_client = OpenDentalClient()
-        self.deputy_client = DeputyClient()
-        self.zoho_client = ZohoClient()
+        self.agent, self.od = agent_and_od()
 
-    def test_open_dental_client_claims_and_charts(self):
-        claims = self.od_client.get_claims(status="Denied")
-        self.assertGreaterEqual(len(claims), 4)
+    def test_routes(self):
+        expected = {90412: Route.APPEAL, 90415: Route.RESUBMIT, 90422: Route.APPEAL, 90428: Route.APPEAL,
+                    90431: Route.DOC_GAP, 90437: Route.REP_CALL, 90440: Route.NO_APPEAL}
+        for cid, route in expected.items():
+            self.assertEqual(self.agent.start(cid)["route"], route, cid)
 
-        claim = claims[0]
-        self.assertEqual(claim.status, "Denied")
-        self.assertIn(claim.denial_code, ["CO-50", "CO-16", "CO-97"])
+    def test_co16_is_never_appealed_and_uses_no_llm(self):
+        s = self.agent.start(90415)
+        self.assertIsNone(s.get("draft"))
+        self.assertEqual(s.get("usage"), [])
+        self.assertTrue(s["work_item"]["checklist"])
 
-        procs = self.od_client.get_claim_procs(claim.claim_id)
-        self.assertGreaterEqual(len(procs), 1)
+    def test_contradicting_chart_blocks_appeal(self):
+        s = self.agent.start(90431)
+        self.assertIsNone(s.get("draft"))
+        self.assertTrue(any("undercut" in q for q in s["work_item"]["contradicting_evidence"]))
 
-        chart = self.od_client.get_clinical_chart(claim.claim_id)
-        self.assertIsNotNone(chart)
-        self.assertIn(chart.provider_name, ["Dr. Marcus Vance, DDS", "Dr. Sophia Chen, DMD", "Dr. Sarah Jenkins, DDS", "Dr. Aaron Patel, DDS"])
-
-    def test_open_dental_commit_tracking(self):
-        claim_id = 90412
-        commit_res = self.od_client.post_claim_tracking(
-            claim_id=claim_id,
-            appeal_text="Formal appeal for D2950 medical necessity.",
-            tracking_def_num=104
-        )
-        self.assertTrue(commit_res["success"])
-        self.assertEqual(commit_res["status"], "AI Review Pending")
-
-        updated_claim = self.od_client.get_claim(claim_id)
-        self.assertEqual(updated_claim.status, "AI Review Pending")
-        self.assertGreater(len(updated_claim.tracking_notes), 0)
-
-    def test_deputy_client(self):
-        rosters = self.deputy_client.get_rosters()
-        self.assertGreater(len(rosters), 0)
-
-        timesheets = self.deputy_client.get_timesheets()
-        self.assertGreater(len(timesheets), 0)
-        self.assertTrue(any(t["overtime_hours"] > 0 for t in timesheets))
-
-        alerts = self.deputy_client.get_staffing_deficit_alerts()
-        self.assertGreaterEqual(len(alerts), 3)
-
-    def test_zoho_client(self):
-        deals = self.zoho_client.get_deals()
-        self.assertGreaterEqual(len(deals), 4)
-
-        target = deals[0]
-        self.assertIn(target.stage, ["Due Diligence", "Identified", "LOI Signed"])
-
-        enriched = self.zoho_client.post_deal_enrichment(
-            deal_id=target.id,
-            median_hhi=112000.0,
-            dentists_per_10k=4.2,
-            population_growth_5yr=14.5,
-            dso_synergy_score=94.5,
-            notes="Strong dental demographics in Austin MSA."
-        )
-        self.assertEqual(enriched.enrichment_status, "Enriched")
-        self.assertEqual(enriched.stage, "Enriched & Ready")
-        self.assertEqual(enriched.dso_synergy_score, 94.5)
+    def test_parse_adjustment_code(self):
+        self.assertEqual(parse_adjustment_code("co-97"), ("CO", "97"))
+        with self.assertRaises(ValueError):
+            parse_adjustment_code("XX-97")
 
 
-class TestSemanticCacheAndEconomics(unittest.TestCase):
+class TestGroundedDrafting(unittest.TestCase):
     def setUp(self):
-        self.cache = SemanticCache(similarity_threshold=0.90)
-        self.calc = PromptCacheCostCalculator()
+        self.agent, self.od = agent_and_od()
 
-    def test_semantic_cache_hit_and_miss(self):
-        # Query that should hit the pre-seeded D2950 cache
-        query_exact = "Payer Delta Dental denied CDT D2950 code CO-50 Medical necessity required >50% coronal breakdown"
-        res_hit = self.cache.lookup(query_exact)
-        self.assertTrue(res_hit.is_hit)
-        self.assertGreaterEqual(res_hit.similarity_score, 0.90)
-        self.assertLess(res_hit.latency_ms, 5.0)  # Sub-5ms guarantee
+    def test_every_quote_is_verbatim_from_chart(self):
+        for cid in (90412, 90422, 90428):
+            s = self.agent.start(cid)
+            notes = re.sub(r"\s+", " ", self.od.get_clinical_chart(cid).clinical_notes).lower()
+            for q in re.findall(r"\"([^\"]{12,})\"", s["draft"]):
+                self.assertIn(re.sub(r"\s+", " ", q).lower().rstrip("."), notes, f"{cid}: {q}")
 
-        # Random query that should miss
-        res_miss = self.cache.lookup("Query completely unrelated to dental orthodontics or endodontics completely obscure")
-        self.assertFalse(res_miss.is_hit)
-        self.assertLess(res_miss.similarity_score, 0.90)
+    def test_letter_requests_allowed_not_billed(self):
+        s = self.agent.start(90412)
+        claim = self.od.get_claim(90412)
+        self.assertIn(f"${claim.allowed_at_issue:,.2f}", s["draft"])
+        self.assertNotIn(f"${claim.billed_fee:,.2f}", s["draft"])
 
-    def test_prompt_cache_cost_calculator(self):
-        # Record cold write
-        m1 = self.calc.record_transaction(
-            prompt_prefix_tokens=3000,
-            dynamic_tokens=200,
-            output_tokens=500,
-            is_cached_prefix=False
-        )
-        self.assertGreater(m1["unoptimized_cost_usd"], 0)
+    def test_regulatory_language_matches_plan_type(self):
+        erisa = self.agent.start(90412)["draft"]      # erisa_employer_group
+        non_erisa = self.agent.start(90428)["draft"]  # non_erisa
+        self.assertIn("2560.503-1", erisa)
+        self.assertNotIn("2560.503-1", non_erisa)
+        for d in (erisa, non_erisa):
+            self.assertNotIn("prompt pay", d.lower())
 
-        # Record cached read (90% discount)
-        m2 = self.calc.record_transaction(
-            prompt_prefix_tokens=3000,
-            dynamic_tokens=200,
-            output_tokens=500,
-            is_cached_prefix=True
-        )
-        self.assertGreater(m2["net_savings_usd"], 0)
-        self.assertEqual(m2["break_even_reads"], 1.39)
-
-        metrics = self.calc.get_metrics()
-        self.assertEqual(metrics.total_calls, 2)
-        self.assertGreater(metrics.net_savings_usd, 0)
+    def test_all_appeals_pass_verifier(self):
+        for cid in (90412, 90422, 90428):
+            v = self.agent.start(cid)["verification"]
+            self.assertTrue(v["passed"], (cid, v["violations"]))
+            self.assertEqual(v["faithfulness"], 1.0)
 
 
-class TestRagasEvaluatorAndTelemetry(unittest.TestCase):
+class TestVerifier(unittest.TestCase):
     def setUp(self):
-        self.evaluator = RagasEvaluator()
-        self.tracer = LangSmithTracer()
-        self.od_client = OpenDentalClient()
+        self.od = OpenDentalClient()
+        self.claim, self.chart = self.od.get_claim(90412), self.od.get_clinical_chart(90412)
+        self.v = GroundingVerifier()
 
-    def test_ragas_evaluation(self):
-        claim = self.od_client.get_claim(90412)
-        chart = self.od_client.get_clinical_chart(90412)
+    def _types(self, text):
+        return {x["type"] for x in self.v.verify(text, self.claim, self.chart)["violations"]}
 
-        appeal = (
-            "This appeal demonstrates that tooth #19 presented with 65% coronal decay. "
-            "Doctor notes confirm excavation of deep caries with ferrule and subgingival preparation. "
-            "Pre-op radiograph attached. In accordance with ADA Prompt Pay and ERISA, remittance is due."
-        )
+    def test_catches_each_failure_mode(self):
+        self.assertIn("FABRICATED_QUOTE", self._types('Notes: "The tooth was completely non-restorable today."'))
+        self.assertIn("UNSUPPORTED_MEASUREMENT", self._types("Coronal loss was 80%."))
+        self.assertIn("UNSUPPORTED_TOOTH", self._types("Tooth #4 was treated."))
+        self.assertIn("BILLED_FEE_DEMAND", self._types("Remit $385.00."))
+        self.assertIn("MISAPPLIED_STATUTE", self._types("Per the Texas Prompt Pay Act."))
+        self.assertIn("UNVERIFIABLE_CITATION", self._types("Per Delta Section 4B."))
+        self.assertIn("UNRESOLVED_PLACEHOLDER", self._types("Patient [PATIENT] presented."))
 
-        score = self.evaluator.evaluate(claim, chart, appeal)
-        self.assertGreaterEqual(score.faithfulness, 0.88)
-        self.assertGreaterEqual(score.context_precision, 0.85)
-        self.assertGreaterEqual(score.answer_relevancy, 0.85)
-        self.assertFalse(score.hallucination_detected)
+    def test_erisa_citation_rejected_for_non_erisa_plan(self):
+        c = self.od.get_claim(90428)
+        v = self.v.verify("Per 29 C.F.R. 2560.503-1(g).", c, self.od.get_clinical_chart(90428))
+        self.assertIn("MISAPPLIED_STATUTE", {x["type"] for x in v["violations"]})
 
-    def test_langsmith_tracer_history(self):
-        traces = self.tracer.get_traces()
-        self.assertEqual(len(traces), 100)
-
-        df = self.tracer.get_telemetry_df()
-        self.assertEqual(len(df), 100)
-        self.assertIn("Faithfulness", df.columns)
-        self.assertIn("Cache Status", df.columns)
-
-        kpis = self.tracer.get_aggregate_kpis()
-        self.assertEqual(kpis["total_runs"], 100)
-        self.assertGreater(kpis["cache_hit_rate"], 50.0)
-        self.assertGreater(kpis["avg_faithfulness"], 90.0)
+    def test_clean_text_passes(self):
+        self.assertEqual(self._types('Chart: "After excavation, approximately 65% of the clinical crown was lost."'),
+                         set())
 
 
-class TestRCMSupervisorWorkflow(unittest.TestCase):
+class TestHITL(unittest.TestCase):
     def setUp(self):
-        self.od_client = OpenDentalClient()
-        self.cache = SemanticCache()
-        self.calc = PromptCacheCostCalculator()
-        self.evaluator = RagasEvaluator()
-        self.supervisor = SupervisorNode(self.cache, self.calc, self.evaluator)
+        self.agent, self.od = agent_and_od()
 
-    def test_end_to_end_workflow(self):
-        claim = self.od_client.get_claim(90412)
-        chart = self.od_client.get_clinical_chart(90412)
+    def test_pauses_then_commits_on_approval(self):
+        s = self.agent.start(90412)
+        self.assertTrue(s["awaiting_review"])
+        self.assertEqual(self.od.get_claim(90412).status, "Denied")
+        r = self.agent.resume(s["thread_id"], "approve", "A. Rivera")
+        self.assertEqual(r["status"], "COMMITTED")
+        self.assertEqual(self.od.get_claim(90412).status, "Appeal Pending Submission")
+        self.assertIn("A. Rivera", self.od.get_claim(90412).tracking_notes[-1])
 
-        # Run multi-agent supervisor
-        state = self.supervisor.run(claim, chart)
-        self.assertIsNotNone(state.appeal_letter)
-        self.assertGreater(len(state.traces), 3)
-        self.assertEqual(state.hitl_status, "PENDING_REVIEW")
-        self.assertGreaterEqual(state.faithfulness_score, 0.85)
+    def test_tampered_edit_is_blocked(self):
+        s = self.agent.start(90412)
+        r = self.agent.resume(s["thread_id"], "approve", "A. Rivera",
+                              edited_text=s["draft"] + '\n"Patient had unbearable pain for a year."')
+        self.assertTrue(r["awaiting_review"])
+        self.assertIn("FABRICATED_QUOTE", r["review_error"])
+        self.assertEqual(self.od.get_claim(90412).status, "Denied")
 
-        # Execute HITL approval and commit
-        commit_res = HITLApproval.approve_and_commit(state, self.od_client, state.appeal_letter)
-        self.assertTrue(commit_res["success"])
-        self.assertEqual(state.hitl_status, "COMMITTED")
+    def test_reject_and_missing_reviewer(self):
+        s = self.agent.start(90412)
+        r = self.agent.resume(s["thread_id"], "approve", "  ")
+        self.assertTrue(r["awaiting_review"])
+        r = self.agent.resume(s["thread_id"], "reject", "A. Rivera")
+        self.assertEqual(r["status"], "REJECTED")
+        self.assertEqual(self.od.get_claim(90412).tracking_notes, [])
 
-        # Verify claim in Open Dental
-        od_claim = self.od_client.get_claim(90412)
-        self.assertEqual(od_claim.status, "AI Review Pending")
+    def test_non_appeal_route_commits_work_item(self):
+        s = self.agent.start(90415)
+        r = self.agent.resume(s["thread_id"], "approve", "A. Rivera")
+        self.assertEqual(self.od.get_claim(90415).status, "Corrected Claim Pending")
+        self.assertEqual(r["status"], "COMMITTED")
 
-    def test_langgraph_stategraph_compilation(self):
-        self.assertIsNotNone(self.supervisor.workflow_graph)
-        self.assertIsNotNone(self.supervisor.compiled_app)
-        mermaid = self.supervisor.get_graph_mermaid()
-        self.assertIn('SupervisorNode', mermaid)
-        self.assertIn('ClinicalRAGWorker', mermaid)
-        self.assertIn('AppealWriterWorker', mermaid)
 
+class TestRetrievalAndPHI(unittest.TestCase):
+    def test_bm25_returns_relevant_chunk(self):
+        hits = PolicyRetriever().search("buildup included in crown same day bundled", cdt="D2950")
+        self.assertEqual(hits[0].id, "GEN-D2950-03")
+
+    def test_sentence_split_keeps_decimals(self):
+        self.assertEqual(len(split_sentences("Cusp fracture 2.5mm deep. Tooth #19 restored.")), 2)
+
+    def test_perio_pockets_need_numeric_depths(self):
+        ev = EvidenceExtractor().extract("D4341", OpenDentalClient().get_clinical_chart(90415))
+        pockets = next(c for c in ev["criteria"] if c["id"] == "D4341-POCKETS")
+        self.assertEqual(pockets["status"], "MET")
+
+    def test_cache_refuses_phi(self):
+        with self.assertRaises(PHILeakError):
+            PolicyContextCache().put(("A", "B", "C"), [{"text": "Eleanor Vance letter"}], ["Eleanor Vance"])
+
+    def test_cache_hit_across_patients_contains_no_phi(self):
+        agent, od = agent_and_od()
+        agent.start(90412)
+        s = agent.start(90431)            # same payer / CDT / CARC, different patient
+        self.assertTrue(s["retrieval_cache_hit"])
+        self.assertNotIn("Eleanor", str(s["policy_chunks"]))
+
+    def test_llm_prompt_is_deidentified(self):
+        od = OpenDentalClient()
+        claim = od.get_claim(90412)
+        ev = EvidenceExtractor().extract("D2950", od.get_clinical_chart(90412))
+        prompt = build_dynamic_prompt({"claim": claim, "chart": od.get_clinical_chart(90412), "evidence": ev,
+                                       "policy_chunks": []}, Deidentifier(claim))
+        self.assertNotIn(claim.patient_name, prompt)
+        self.assertNotIn(str(claim.patient_id), prompt)
+
+
+class TestEconomics(unittest.TestCase):
+    def test_break_even_is_first_read(self):
+        self.assertAlmostEqual(break_even_reads(), 0.278, places=3)
+
+    def test_cost_from_usage(self):
+        e = PromptCacheEconomics()
+        row = e.record({"input_tokens": 400, "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 2000, "output_tokens": 500}, "measured")
+        self.assertAlmostEqual(row["cost_usd"], (400 * 3 + 2000 * 0.3 + 500 * 15) / 1e6)
+        self.assertAlmostEqual(row["no_cache_cost_usd"], (2400 * 3 + 500 * 15) / 1e6)
+
+    def test_simulator_ttl_and_min_length(self):
+        clock = [0.0]
+        sim = PrefixCacheSimulator(clock=lambda: clock[0])
+        self.assertGreater(sim.usage_for(STATIC_PREFIX, "x", "y")["cache_creation_input_tokens"], 0)
+        clock[0] = 100
+        self.assertGreater(sim.usage_for(STATIC_PREFIX, "x", "y")["cache_read_input_tokens"], 0)
+        clock[0] = 1000                    # TTL expired
+        self.assertGreater(sim.usage_for(STATIC_PREFIX, "x", "y")["cache_creation_input_tokens"], 0)
+        short = sim.usage_for("too short to cache", "x", "y")
+        self.assertEqual(short["cache_read_input_tokens"] + short["cache_creation_input_tokens"], 0)
+
+    def test_static_prefix_is_cacheable(self):
+        self.assertGreaterEqual(estimate_tokens(STATIC_PREFIX), 1024)
+
+
+class TestOpsIntegrations(unittest.TestCase):
+    def test_overtime_excludes_exempt_doctors(self):
+        alerts = DeputyClient().get_staffing_deficit_alerts()
+        ot = [a for a in alerts if a.alert_type == "OVERTIME_RISK"]
+        self.assertTrue(ot)
+        self.assertFalse(any("Dr." in a.description for a in ot))
+        self.assertTrue(all(a.est_cost_impact_usd > 0 for a in ot))
+
+    def test_zoho_score_is_deterministic_and_bounded(self):
+        z1, z2 = ZohoClient(), ZohoClient()
+        a, b = z1.enrich_deal("ZH-8819"), z2.enrich_deal("ZH-8819")
+        self.assertEqual(a.fit_score, b.fit_score)
+        self.assertTrue(0 <= a.fit_score <= 10)
+
+
+class TestGoldenEval(unittest.TestCase):
+    def test_suite(self):
+        rep = run_golden_eval()
+        self.assertEqual(rep.metrics["route_accuracy"], 1.0)
+        self.assertEqual(rep.metrics["faithfulness"], 1.0)
+        self.assertTrue(rep.checks["passed"].all(), rep.checks.to_string())
 
 
 if __name__ == "__main__":

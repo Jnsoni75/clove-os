@@ -1,587 +1,365 @@
 """
-agents/rcm_supervisor.py - Multi-Agent RCM Denial Resolution via LangGraph
+agents/rcm_supervisor.py - RCM denial agent (LangGraph).
 
-Implements an enterprise StateGraph supervisor pattern powered by LangGraph:
-1. SupervisorNode (StateGraph Entry): Ingests denial payloads from Open Dental, checks
-   in-memory semantic cache, and dynamically routes between warm fast-path and cold worker subgraphs.
-2. ClinicalRAGWorker (Worker Node): Queries payer policy knowledge bases (Delta Dental,
-   MetLife, Cigna, Guardian) and extracts clinical proof from contemporaneous doctor chart notes.
-3. AppealWriterWorker (Worker Node): Synthesizes ADA-compliant, evidence-backed appeal letters
-   citing exact clinical measurements, tooth numbers, and Prompt Pay statutory rules.
-4. ObservabilityHarness (Eval Node): Executes live RAGAS evaluation checks and hallucination guards.
-5. HITLApprovalBarrier (Approval Gate): Enforces Human-in-the-Loop review before committing
-   audit records to Open Dental eConnector.
+Flow:
+    triage ──APPEAL──▶ retrieve_policy ─▶ extract_evidence ──criteria met──▶ draft ─▶ verify
+      │                                        │                              ▲         │
+      │                                        └─gaps─▶ documentation_gap     └─revise──┤ (max 2)
+      ├─RESUBMIT──▶ build_resubmission                                                 │
+      ├─REP_CALL──▶ build_rep_call                                                     ▼
+      └─NO_APPEAL─▶ build_no_appeal ───────────────────────────────────────▶ human_review (interrupt)
+                                                                                      │
+                                                         approve ─▶ commit ─(edited text fails verify)─▶ human_review
+                                                         reject  ─▶ END (nothing written)
 
-HIPAA Safeguards:
-- Stateless execution with zero data retention (ZDR).
-- Zero patient PHI transmitted to untrusted external endpoints.
-- All doctor chart notes accessed read-only in memory.
+Principles:
+- Triage BEFORE any LLM call. Most denials don't need a letter (CO-16 is resubmitted,
+  frequency limits aren't appealed, systemic zero-pay goes to a rep call). That is the
+  biggest cost lever, before any caching.
+- The agent refuses to appeal when the chart doesn't support it (DOCUMENTATION_GAP).
+- Nothing reaches Open Dental without a named human approver; edited text is re-verified.
+- Latencies in traces are measured, never padded.
 """
 
+from __future__ import annotations
+
+import operator
 import time
-from typing import Dict, List, Optional, Any, Tuple
-from pydantic import BaseModel, Field
 from datetime import datetime
+from typing import Any, Annotated, Dict, List, Optional, TypedDict
 
-from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
 
-from integrations.mock_apis import DentalClaim, ClinicalChart, OpenDentalClient
-from cache.token_optimizer import SemanticCache, PromptCacheCostCalculator
-from eval.observability import RagasEvaluator
+from agents.llm import TemplateDrafter, get_default_drafter
+from agents.retrieval import EvidenceExtractor, PolicyRetriever
+from cache.token_optimizer import PolicyContextCache, PromptCacheEconomics
+from eval.grounding import GroundingVerifier
+from integrations.mock_apis import ClinicalChart, DentalClaim, OpenDentalClient
+from knowledge.rcm_reference import (
+    PLAYBOOK, RESUBMISSION_CHECKLIST, ZERO_PAY_REP_CALL_THRESHOLD_PCT, Route, parse_adjustment_code,
+)
 
-
-# ==========================================
-# Workflow State Schema (LangGraph State)
-# ==========================================
-
-class ExecutionStepTrace(BaseModel):
-    step_id: str
-    node_name: str
-    action: str
-    latency_ms: float
-    input_tokens: int
-    output_tokens: int
-    cached: bool
-    status: str  # "SUCCESS", "CACHE_HIT", "BLOCKED_HITL", "COMMITTED"
-    details: str
-    timestamp: str = Field(default_factory=lambda: datetime.now().strftime("%H:%M:%S.%f")[:-3])
-
-
-class RCMWorkflowState(BaseModel):
-    claim_id: int
-    claim: DentalClaim
-    clinical_chart: Optional[ClinicalChart] = None
-    supervisor_assessment: Dict[str, Any] = Field(default_factory=dict)
-    rag_findings: Dict[str, Any] = Field(default_factory=dict)
-    appeal_letter: Optional[str] = None
-    faithfulness_score: float = 0.0
-    context_precision: float = 0.0
-    answer_relevancy: float = 0.0
-    hitl_status: str = "PENDING_REVIEW"  # "PENDING_REVIEW", "APPROVED", "COMMITTED", "REJECTED"
-    cache_hit: bool = False
-    traces: List[ExecutionStepTrace] = Field(default_factory=list)
-    financial_savings: Dict[str, float] = Field(default_factory=dict)
+MAX_REVISIONS = 2
 
 
 # ==========================================
-# Worker Node: Clinical RAG Worker
+# State
 # ==========================================
 
-class ClinicalRAGWorker:
-    """
-    Simulates clinical retrieval-augmented generation against payer clinical coverage guidelines
-    and validates doctor chart note evidence.
-    """
+class RCMState(TypedDict, total=False):
+    claim: Dict[str, Any]
+    chart: Optional[Dict[str, Any]]
+    payer_stats: Dict[str, Any]
+    route: str
+    triage: Dict[str, Any]
+    policy_chunks: List[Dict[str, Any]]
+    retrieval_cache_hit: bool
+    evidence: Dict[str, Any]
+    draft: str
+    draft_backend: str
+    revision_count: int
+    verification: Dict[str, Any]
+    work_item: Dict[str, Any]          # output for non-appeal routes
+    review: Dict[str, Any]
+    review_error: str
+    status: str                        # PENDING_REVIEW | COMMITTED | REJECTED
+    commit_result: Dict[str, Any]
+    traces: Annotated[List[Dict[str, Any]], operator.add]
+    usage: Annotated[List[Dict[str, Any]], operator.add]
 
-    PAYER_POLICY_KNOWLEDGE_BASE = {
-        "D2950": {
-            "title": "Core Buildup (Including Pins) - CDT D2950",
-            "section": "Delta Dental Commercial Dental Policy Section 4B / MetLife Rule 11.2",
-            "mandatory_criteria": [
-                "Loss of sound coronal tooth structure exceeding 50%",
-                "Essential retention and resistance form required for indirect crown restoration",
-                "Documentation of pulp chamber floor status or post-endodontic status",
-                "Pre-operative or post-excavation radiograph or intraoral photo"
-            ]
-        },
-        "D4341": {
-            "title": "Periodontal Scaling and Root Planing (4+ Teeth) - CDT D4341",
-            "section": "MetLife Dental Clinical Guidelines Section 3.2 / Cigna Perio Policy",
-            "mandatory_criteria": [
-                "Full mouth 6-point periodontal charting recorded within past 12 months",
-                "Pocket probing depths of >= 5mm on qualifying teeth in quadrant",
-                "Radiographic evidence of alveolar crestal bone loss (>= 20%)",
-                "Documented active bleeding on probing or subgingival calculus"
-            ]
-        },
-        "D2740": {
-            "title": "Porcelain/Ceramic Substrate Crown - CDT D2740",
-            "section": "Cigna Dental Specialty Guidelines Section 7.1 / ADA Coding Rule",
-            "mandatory_criteria": [
-                "Endodontically treated tooth or severe cuspal fracture",
-                "Remaining circumferential tooth structure < 2mm requiring full coronal coverage",
-                "Distinction from routine provisional post-endodontic restorations",
-                "High masticatory load site requiring high-strength ceramic (e.g. Zirconia)"
-            ]
-        },
-        "D7953": {
-            "title": "Bone Replacement Graft for Ridge Preservation - CDT D7953",
-            "section": "Guardian Life Oral Surgery & Implant Guidelines Section 8.4",
-            "mandatory_criteria": [
-                "Atraumatic extraction accompanied by Class II/III buccal plate defect",
-                "Medical necessity for socket preservation prior to endosteal implant",
-                "Allograft / xenograft placement distinct from routine surgical extraction",
-                "Diagnostic CBCT or periapical imaging verifying crestal bone deficiency"
-            ]
-        }
-    }
 
-    def evaluate(self, claim: DentalClaim, chart: Optional[ClinicalChart]) -> Dict[str, Any]:
-        """Evaluates clinical documentation against payer policy requirements."""
-        procs = claim.procs
-        primary_proc = procs[0] if procs else None
-        proc_code = primary_proc.proc_code if primary_proc else "D2950"
+def _claim(s: RCMState) -> DentalClaim:
+    return DentalClaim.model_validate(s["claim"])
 
-        policy = self.PAYER_POLICY_KNOWLEDGE_BASE.get(proc_code, self.PAYER_POLICY_KNOWLEDGE_BASE["D2950"])
 
-        findings = {
-            "policy_title": policy["title"],
-            "policy_section": policy["section"],
-            "mandatory_criteria": policy["mandatory_criteria"],
-            "criteria_satisfied": [],
-            "criteria_unmet": [],
-            "extracted_evidence": [],
-            "clinical_confidence": 0.0
-        }
+def _chart(s: RCMState) -> Optional[ClinicalChart]:
+    return ClinicalChart.model_validate(s["chart"]) if s.get("chart") else None
 
-        if not chart:
-            findings["criteria_unmet"] = policy["mandatory_criteria"]
-            findings["clinical_confidence"] = 0.10
-            return findings
 
-        notes = chart.clinical_notes
-
-        # Evaluate D2950
-        if proc_code == "D2950":
-            if chart.decay_percentage and chart.decay_percentage >= 50.0:
-                findings["criteria_satisfied"].append(f"Coronal loss: {chart.decay_percentage}% (Threshold >50% satisfied)")
-                findings["extracted_evidence"].append(f"Decay measurement: {chart.decay_percentage}% coronal tooth loss documented.")
-            else:
-                findings["criteria_unmet"].append("Coronal tooth loss documentation below 50%")
-
-            if "ferrule" in notes.lower() or "retention" in notes.lower() or "axial wall" in notes.lower():
-                findings["criteria_satisfied"].append("Structural retention & ferrule necessity documented in doctor notes.")
-                findings["extracted_evidence"].append("Doctor noted: 'provide essential retention, axial wall resistance form, and ferrule'.")
-
-            if "radiograph" in notes.lower() or chart.radiograph_attached:
-                findings["criteria_satisfied"].append("Diagnostic imaging attached verifying subgingival breakdown.")
-
-        # Evaluate D4341
-        elif proc_code == "D4341":
-            if chart.probing_depths and ("6mm" in chart.probing_depths or "7mm" in chart.probing_depths or "5mm" in chart.probing_depths):
-                findings["criteria_satisfied"].append(f"Periodontal pocket depths >= 5mm documented: {chart.probing_depths}")
-                findings["extracted_evidence"].append(f"Probing depth records: {chart.probing_depths}")
-
-            if chart.bone_loss_percentage and chart.bone_loss_percentage >= 20.0:
-                findings["criteria_satisfied"].append(f"Radiographic crestal bone loss: {chart.bone_loss_percentage}% (Threshold >=20% met)")
-                findings["extracted_evidence"].append(f"Radiographic bone loss verified at {chart.bone_loss_percentage}%.")
-
-            if "bleeding" in notes.lower() or "calculus" in notes.lower():
-                findings["criteria_satisfied"].append("Active bleeding on probing & tenacious subgingival calculus recorded.")
-
-        # Evaluate D2740
-        elif proc_code == "D2740":
-            if "fracture" in notes.lower() or "compromised" in notes.lower() or "root canal" in notes.lower():
-                findings["criteria_satisfied"].append("Severe structural compromise post-endodontic therapy documented.")
-                findings["extracted_evidence"].append("Doctor noted: 'less than 2mm sound tooth structure remaining circumferentially'.")
-
-            if "vertical root fracture" in notes.lower():
-                findings["criteria_satisfied"].append("Medical necessity established to prevent catastrophic root fracture.")
-
-        # Evaluate D7953
-        elif proc_code == "D7953":
-            if "defect" in notes.lower() or "buccal plate" in notes.lower() or "ridge" in notes.lower():
-                findings["criteria_satisfied"].append("Class II ridge defect and buccal plate deficiency confirmed.")
-                findings["extracted_evidence"].append("Doctor noted: 'buccal plate defect noted (Class II ridge deficiency)'.")
-
-            if "cbct" in notes.lower() or chart.radiograph_attached:
-                findings["criteria_satisfied"].append("CBCT cross-sectional scans confirm crestal height deficiency.")
-
-        total_criteria = len(policy["mandatory_criteria"])
-        satisfied_count = len(findings["criteria_satisfied"])
-        confidence = min(0.99, max(0.65, (satisfied_count / total_criteria) * 0.98 if total_criteria else 0.85))
-        findings["clinical_confidence"] = round(confidence, 2)
-
-        return findings
+def _trace(node: str, t0: float, detail: str, **extra) -> Dict[str, Any]:
+    return {"node": node, "latency_ms": round((time.perf_counter() - t0) * 1000, 2),
+            "detail": detail, "ts": datetime.now().strftime("%H:%M:%S"), **extra}
 
 
 # ==========================================
-# Worker Node: Appeal Writer Worker
+# Agent
 # ==========================================
 
-class AppealWriterWorker:
-    """
-    Drafts an evidence-backed, ADA-compliant formal appeal letter citing clinical chart
-    excerpts, statutory Prompt Payment timelines, and payer policy criteria.
-    """
-
-    def draft_appeal(
-        self,
-        claim: DentalClaim,
-        chart: Optional[ClinicalChart],
-        rag_findings: Dict[str, Any]
-    ) -> str:
-        """Constructs a comprehensive, legally sound dental insurance appeal letter."""
-        proc = claim.procs[0] if claim.procs else None
-        proc_code = proc.proc_code if proc else "D2950"
-        proc_desc = proc.proc_desc if proc else "Core buildup"
-        tooth = proc.tooth_num if proc and proc.tooth_num else "Affected Site"
-
-        date_str = datetime.now().strftime("%B %d, %Y")
-        patient_name = claim.patient_name
-        patient_id = claim.patient_id
-        claim_id = claim.claim_id
-        payer_name = claim.payer_name
-        clinic_name = claim.clinic_name
-        dos = claim.date_of_service
-        billed_fee = f"${claim.billed_fee:,.2f}"
-
-        provider_name = chart.provider_name if chart else "Treating Attending Dentist"
-        provider_npi = chart.provider_npi if chart else "1849204912"
-        chart_notes = chart.clinical_notes if chart else "Clinical notes on file."
-
-        evidence_bullets = "\n".join([f"  • {item}" for item in rag_findings.get("criteria_satisfied", [])])
-        evidence_quotes = "\n".join([f"  > \"{quote}\"" for quote in rag_findings.get("extracted_evidence", [])])
-
-        appeal_letter = f"""CLOVE DENTAL DSO REVENUE CYCLE MANAGEMENT
-Centralized Appeals Unit — Operations Command
-100-Clinic Dental Support Network | Office: {clinic_name}
-
-DATE: {date_str}
-
-TO:
-{payer_name} — Claims Appeals & Grievance Department
-Attn: Dental Review Committee / Medical Director
-Payer Reference ID: {claim.payer_id}
-
-RE: FORMAL FIRST-LEVEL CLINICAL APPEAL FOR RECONSIDERATION
-Claim ID: {claim_id} | Patient ID: {patient_id}
-Patient Name: {patient_name}
-Date of Service: {dos}
-Billed Amount: {billed_fee}
-Denial Code Cited: {claim.denial_code} — {claim.denial_description}
-Contested Procedure Line: CDT {proc_code} ({proc_desc}) | Tooth/Site: {tooth}
-Treating Provider: {provider_name} (NPI: {provider_npi})
-
-Dear Dental Claims Review Committee,
-
-On behalf of {clinic_name} and our treating dental provider, {provider_name}, this letter serves as a formal, evidence-backed first-level clinical appeal contesting the adverse determination and claim denial {claim.denial_code} regarding procedure {proc_code} rendered on {dos}.
-
-The denial cited insufficient documentation or unbundling of service. However, an exhaustive review of the attached clinical record, diagnostic radiographs, and periodontal measurements unequivocally establishes that procedure {proc_code} was medically necessary, independently performed, and fully satisfied all clinical coverage benchmarks specified in {rag_findings.get('policy_section', 'Payer Clinical Criteria')}.
-
-1. CLINICAL POLICY ALIGNMENT & EVIDENTIARY CRITERIA:
-In direct accordance with published coverage criteria for {proc_code} ({rag_findings.get('policy_title', '')}), the following objective clinical parameters were documented in the electronic patient record at the time of surgical execution:
-{evidence_bullets}
-
-2. CONTEMPORANEOUS CLINICAL DOCTOR CHART EXCERPTS:
-Reviewing the contemporaneous progress notes authored by {provider_name}:
-{evidence_quotes}
-
-Doctor's Detailed Operative Narrative:
-\"{chart_notes}\"
-
-3. REGULATORY COMPLIANCE & PROMPT PAY NOTICE:
-The procedures billed represent non-inclusive, clinically distinct treatment modalities as defined by the American Dental Association (ADA) Code on Dental Procedures and Nomenclature. Withholding payment for services that meet documented criteria constitutes an unjustified coverage restriction.
-
-In accordance with State Insurance Prompt Payment regulations and ERISA healthcare claims requirements (29 C.F.R. § 2560.503-1), we request that this appeal be adjudicated within thirty (30) days of receipt, and that remittance in the amount of {billed_fee} be issued promptly to {clinic_name}.
-
-Should you require immediate telephonic peer-to-peer discussion, please contact our Centralized RCM Division at (888) 555-CLOVE.
-
-Respectfully submitted,
-
-Centralized RCM Denial Resolution Unit
-Clove Dental Multi-Clinic DSO
-On Behalf of {provider_name}, DDS/DMD
-NPI: {provider_npi}
-Enclosures: Diagnostic Radiographs, Detailed 6-Point Periodontal Charting, Intraoral Color Photography, Electronic Progress Notes."""
-        return appeal_letter
-
-
-# ==========================================
-# LangGraph Supervisor Node & StateGraph Engine
-# ==========================================
-
-class SupervisorNode:
-    """
-    Supervisor Node orchestrating the LangGraph StateGraph workflow for RCM denial resolution.
-    Connects SupervisorNode, ClinicalRAGWorker, AppealWriterWorker, ObservabilityHarness,
-    and HITLApprovalBarrier.
-    """
-
+class RCMDenialAgent:
     def __init__(
         self,
-        semantic_cache: SemanticCache,
-        cost_calculator: PromptCacheCostCalculator,
-        ragas_evaluator: Optional[RagasEvaluator] = None
+        od_client: OpenDentalClient,
+        drafter: Any = None,
+        retrieval_cache: Optional[PolicyContextCache] = None,
+        economics: Optional[PromptCacheEconomics] = None,
     ):
-        self.semantic_cache = semantic_cache
-        self.cost_calculator = cost_calculator
-        self.rag_worker = ClinicalRAGWorker()
-        self.writer_worker = AppealWriterWorker()
-        self.ragas_evaluator = ragas_evaluator or RagasEvaluator()
+        self.od = od_client
+        self.drafter = drafter or get_default_drafter()
+        self.retriever = PolicyRetriever()
+        self.extractor = EvidenceExtractor()
+        self.verifier = GroundingVerifier()
+        self.cache = retrieval_cache or PolicyContextCache()
+        self.economics = economics or PromptCacheEconomics()
+        self.graph = self._build().compile(checkpointer=InMemorySaver())
 
-        # Build and compile LangGraph StateGraph
-        self.workflow_graph = self._build_langgraph()
-        self.compiled_app = self.workflow_graph.compile()
-
-    def _build_langgraph(self) -> StateGraph:
-        """Constructs the LangGraph StateGraph with conditional fast-path cache routing."""
-        builder = StateGraph(RCMWorkflowState)
-
-        # -----------------------------------------------------------------
-        # Node 1: Supervisor Node Inspection
-        # -----------------------------------------------------------------
-        def supervisor_node_fn(state: RCMWorkflowState) -> Dict[str, Any]:
-            step_start = time.perf_counter()
-            primary_proc = state.claim.procs[0].proc_code if state.claim.procs else "D2950"
-            cache_query = f"Payer {state.claim.payer_name} denied CDT {primary_proc} code {state.claim.denial_code} {state.claim.denial_description}"
-
-            cache_res = self.semantic_cache.lookup(cache_query)
-            step_latency = (time.perf_counter() - step_start) * 1000.0
-
-            if cache_res.is_hit:
-                # Fast path cached resolution
-                cost_metrics = self.cost_calculator.record_transaction(
-                    prompt_prefix_tokens=3200,
-                    dynamic_tokens=150,
-                    output_tokens=620,
-                    is_cached_prefix=True
-                )
-                t1 = ExecutionStepTrace(
-                    step_id="STEP-1-CACHE",
-                    node_name="SupervisorNode",
-                    action="Semantic Cache Lookup",
-                    latency_ms=round(cache_res.latency_ms, 2),
-                    input_tokens=0,
-                    output_tokens=0,
-                    cached=True,
-                    status="CACHE_HIT",
-                    details=f"Cosine similarity: {cache_res.similarity_score:.4f} >= 0.90 threshold. Retrieved cached appeal instantly at $0 LLM compute cost."
-                )
-                t2 = ExecutionStepTrace(
-                    step_id="STEP-2-ROUTING",
-                    node_name="SupervisorNode",
-                    action="Fast-Path Cache Dispatch",
-                    latency_ms=round(step_latency, 2),
-                    input_tokens=0,
-                    output_tokens=0,
-                    cached=True,
-                    status="SUCCESS",
-                    details="Bypassed downstream workers (RAG & Writer). Delivered verified pre-cached appeal directly to HITL verification queue."
-                )
-                return {
-                    "cache_hit": True,
-                    "appeal_letter": cache_res.cached_content,
-                    "financial_savings": cost_metrics,
-                    "traces": state.traces + [t1, t2]
-                }
+    # ------------------------------------------------------------------ nodes
+    def _triage(self, s: RCMState) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        claim = _claim(s)
+        stats = self.od.get_payer_denial_stats(claim.payer_id)
+        if not claim.denial_code:
+            route, reason, entry = Route.NO_APPEAL, "No denied lines on this claim.", None
+        else:
+            group, carc = parse_adjustment_code(claim.denial_code)
+            entry = PLAYBOOK.get(carc)
+            if entry is None:
+                route, reason = Route.NO_APPEAL, f"CARC {carc} not in playbook - manual review."
+            elif entry.route == Route.APPEAL and stats["zero_pay_pct"] >= ZERO_PAY_REP_CALL_THRESHOLD_PCT:
+                route = Route.REP_CALL
+                reason = (f"{claim.payer_name} zero-paid {stats['zero_pay_pct']}% of lines in the last "
+                          f"{stats['window_days']} days (>= {ZERO_PAY_REP_CALL_THRESHOLD_PCT:.0f}%). "
+                          f"Systemic issue - call the payer rep before writing individual appeals.")
             else:
-                assessment = {
-                    "denial_category": "Medical Necessity / Lack of Evidence" if state.claim.denial_code in ["CO-50", "CO-16"] else "Bundled Coding",
-                    "primary_proc": primary_proc,
-                    "complexity_level": "High" if len(state.claim.procs) > 1 else "Standard",
-                    "payer_appeal_window_days": 180,
-                    "target_worker": "ClinicalRAGWorker"
-                }
-                t = ExecutionStepTrace(
-                    step_id="STEP-1-INSPECT",
-                    node_name="SupervisorNode",
-                    action="Inspect Denial Payload",
-                    latency_ms=round(step_latency, 2),
-                    input_tokens=450,
-                    output_tokens=120,
-                    cached=False,
-                    status="SUCCESS",
-                    details=f"Identified denial {state.claim.denial_code} on CDT {primary_proc}. Extracted clinical parameters and routed to ClinicalRAGWorker."
-                )
-                return {
-                    "cache_hit": False,
-                    "supervisor_assessment": assessment,
-                    "traces": state.traces + [t]
-                }
+                route, reason = entry.route, entry.rationale
+        triage = {
+            "denial_code": claim.denial_code, "route": route, "reason": reason,
+            "appeal_type": entry.appeal_type if entry else None,
+            "allowed_at_issue": claim.allowed_at_issue,
+        }
+        return {"route": route, "triage": triage, "payer_stats": stats, "revision_count": 0,
+                "traces": [_trace("triage", t0, f"{claim.denial_code} -> {route}", route=route)]}
 
-        # -----------------------------------------------------------------
-        # Node 2: Clinical RAG Worker
-        # -----------------------------------------------------------------
-        def clinical_rag_fn(state: RCMWorkflowState) -> Dict[str, Any]:
-            step_start = time.perf_counter()
-            findings = self.rag_worker.evaluate(state.claim, state.clinical_chart)
-            step_latency = (time.perf_counter() - step_start) * 1000.0
+    def _retrieve_policy(self, s: RCMState) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        claim = _claim(s)
+        line = claim.primary_denied_proc
+        key = PolicyContextCache.key(claim.payer_id, line.proc_code, claim.carc)
+        cached = self.cache.get(key)
+        if cached is not None:
+            return {"policy_chunks": cached, "retrieval_cache_hit": True,
+                    "traces": [_trace("retrieve_policy", t0, f"Retrieval cache HIT {key}", cache="HIT")]}
+        query = f"{line.proc_code} {line.proc_desc} {s['triage'].get('appeal_type') or ''} {line.payer_remark}"
+        chunks = [c.to_dict() for c in self.retriever.search(query, cdt=line.proc_code, payer_id=claim.payer_id)]
+        self.cache.put(key, chunks, forbidden_terms=[claim.patient_name, str(claim.patient_id)])
+        return {"policy_chunks": chunks, "retrieval_cache_hit": False,
+                "traces": [_trace("retrieve_policy", t0,
+                                  f"BM25 top-{len(chunks)}: {', '.join(c['id'] for c in chunks)}", cache="MISS")]}
 
-            t = ExecutionStepTrace(
-                step_id="STEP-2-RAG",
-                node_name="ClinicalRAGWorker",
-                action="Payer Policy & Clinical Chart Retrieval",
-                latency_ms=round(step_latency + 120.0, 2),
-                input_tokens=2100,
-                output_tokens=480,
-                cached=False,
-                status="SUCCESS",
-                details=f"Cross-referenced {findings['policy_section']}. Corroborated {len(findings['criteria_satisfied'])} clinical proofs (Confidence: {findings['clinical_confidence'] * 100:.0f}%)."
-            )
-            return {
-                "rag_findings": findings,
-                "traces": state.traces + [t]
-            }
+    def _extract_evidence(self, s: RCMState) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        claim = _claim(s)
+        ev = self.extractor.extract(claim.primary_denied_proc.proc_code, _chart(s))
+        met = sum(1 for c in ev["criteria"] if c["status"] == "MET")
+        return {"evidence": ev, "traces": [_trace(
+            "extract_evidence", t0, f"{met}/{len(ev['criteria'])} criteria met; gaps: {len(ev['gaps'])}")]}
 
-        # -----------------------------------------------------------------
-        # Node 3: Appeal Writer Worker
-        # -----------------------------------------------------------------
-        def appeal_writer_fn(state: RCMWorkflowState) -> Dict[str, Any]:
-            step_start = time.perf_counter()
-            appeal_letter = self.writer_worker.draft_appeal(state.claim, state.clinical_chart, state.rag_findings)
-            step_latency = (time.perf_counter() - step_start) * 1000.0
+    def _ctx(self, s: RCMState) -> Dict[str, Any]:
+        return {"claim": _claim(s), "chart": _chart(s), "evidence": s["evidence"],
+                "policy_chunks": s.get("policy_chunks", []), "appeal_type": s["triage"].get("appeal_type")}
 
-            is_cached_prefix = (state.claim.claim_id % 2 == 0)
-            cost_metrics = self.cost_calculator.record_transaction(
-                prompt_prefix_tokens=2800,
-                dynamic_tokens=420,
-                output_tokens=680,
-                is_cached_prefix=is_cached_prefix
-            )
+    def _draft(self, s: RCMState) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        ctx = self._ctx(s)
+        prior_v = s.get("verification")
+        if s.get("draft") and prior_v and not prior_v["passed"]:
+            res = self.drafter.revise(ctx, s["draft"], prior_v["violations"])
+            rev = s.get("revision_count", 0) + 1
+            label = f"Revision {rev} ({len(prior_v['violations'])} violations)"
+        else:
+            res = self.drafter.draft(ctx)
+            rev = s.get("revision_count", 0)
+            label = "Initial draft"
+        cost = self.economics.record(res.usage, res.usage_source)
+        return {
+            "draft": res.text, "draft_backend": res.backend, "revision_count": rev,
+            "usage": [{**res.usage, "source": res.usage_source, "cost_usd": cost["cost_usd"],
+                       "saved_usd": cost["saved_usd"]}],
+            "traces": [_trace("draft", t0, f"{label} via {res.backend}",
+                              cache_read=res.usage.get("cache_read_input_tokens", 0) > 0)],
+        }
 
-            primary_proc = state.claim.procs[0].proc_code if state.claim.procs else "D2950"
-            cache_query = f"Payer {state.claim.payer_name} denied CDT {primary_proc} code {state.claim.denial_code} {state.claim.denial_description}"
-            self.semantic_cache.put(cache_query, appeal_letter, {"cdt_code": primary_proc, "payer": state.claim.payer_name})
+    def _verify(self, s: RCMState) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        v = self.verifier.verify(s["draft"], _claim(s), _chart(s), s.get("evidence"), s.get("policy_chunks"))
+        return {"verification": v, "traces": [_trace(
+            "verify", t0, f"{'PASS' if v['passed'] else 'FAIL'} - faithfulness {v['faithfulness']:.0%}, "
+                          f"{len(v['violations'])} violations", passed=v["passed"])]}
 
-            t = ExecutionStepTrace(
-                step_id="STEP-3-WRITER",
-                node_name="AppealWriterWorker",
-                action="Synthesize ADA-Compliant Appeal Letter",
-                latency_ms=round(step_latency + 240.0, 2),
-                input_tokens=3220,
-                output_tokens=680,
-                cached=is_cached_prefix,
-                status="SUCCESS",
-                details=f"Drafted formal appeal citing doctor quotes and Prompt Pay statute. Prefix Cache Read: {'HIT (90% discount)' if is_cached_prefix else 'MISS (Cache write)'}."
-            )
-            return {
-                "appeal_letter": appeal_letter,
-                "financial_savings": cost_metrics,
-                "traces": state.traces + [t]
-            }
+    def _documentation_gap(self, s: RCMState) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        claim, chart = _claim(s), _chart(s)
+        ev = s["evidence"]
+        contradicted = [c for c in ev["criteria"] if c["status"] == "CONTRADICTED"]
+        item = {
+            "type": Route.DOC_GAP,
+            "summary": "Chart does not support an appeal. Do not appeal; request a provider addendum only "
+                       "if it reflects what was actually done.",
+            "gaps": ev["gaps"],
+            "contradicting_evidence": [q for c in contradicted for q in c["quotes"]],
+            "addressed_to": chart.provider_name if chart else "Treating provider",
+            "checklist": RESUBMISSION_CHECKLIST.get(claim.primary_denied_proc.proc_code, []),
+        }
+        return {"route": Route.DOC_GAP, "work_item": item,
+                "traces": [_trace("documentation_gap", t0, f"{len(ev['gaps'])} unmet required criteria")]}
 
-        # -----------------------------------------------------------------
-        # Node 4: Observability & RAGAS Evaluation Harness
-        # -----------------------------------------------------------------
-        def ragas_eval_fn(state: RCMWorkflowState) -> Dict[str, Any]:
-            policy_sec = state.rag_findings.get("policy_section", "Payer Clinical Coverage Guidelines")
-            ragas_res = self.ragas_evaluator.evaluate(
-                claim=state.claim,
-                chart=state.clinical_chart,
-                appeal_text=state.appeal_letter or "",
-                policy_section=policy_sec
-            )
-            guard_status = "PASSED" if not ragas_res.hallucination_detected else "FLAGGED"
-            t = ExecutionStepTrace(
-                step_id="STEP-4-RAGAS",
-                node_name="ObservabilityHarness",
-                action="RAGAS Faithfulness & Hallucination Guard",
-                latency_ms=45.0,
-                input_tokens=850,
-                output_tokens=60,
-                cached=False,
-                status=guard_status,
-                details=f"Faithfulness: {ragas_res.faithfulness * 100:.1f}%. {ragas_res.reasoning}"
-            )
-            return {
-                "faithfulness_score": ragas_res.faithfulness,
-                "context_precision": ragas_res.context_precision,
-                "answer_relevancy": ragas_res.answer_relevancy,
-                "traces": state.traces + [t]
-            }
+    def _build_resubmission(self, s: RCMState) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        claim = _claim(s)
+        entry = PLAYBOOK["16"]
+        codes = sorted({p.proc_code for p in claim.denied_procs})
+        item = {
+            "type": Route.RESUBMIT,
+            "summary": entry.rationale,
+            "lines": [f"CDT {p.proc_code} {p.tooth_num or ''} - payer remark: {p.payer_remark}"
+                      for p in claim.denied_procs],
+            "actions": list(entry.actions),
+            "checklist": [i for c in codes for i in RESUBMISSION_CHECKLIST.get(c, [])],
+        }
+        return {"work_item": item, "traces": [_trace("build_resubmission", t0,
+                                                     f"{len(item['checklist'])} attachments required")]}
 
-        # -----------------------------------------------------------------
-        # Node 5: Human-in-the-Loop Barrier
-        # -----------------------------------------------------------------
-        def hitl_barrier_fn(state: RCMWorkflowState) -> Dict[str, Any]:
-            t = ExecutionStepTrace(
-                step_id="STEP-5-HITL",
-                node_name="HITLApprovalBarrier",
-                action="Hold for Clinical Billing Approval",
-                latency_ms=5.0,
-                input_tokens=0,
-                output_tokens=0,
-                cached=False,
-                status="BLOCKED_HITL",
-                details="Execution paused at verification barrier. Awaiting licensed dentist or certified billing specialist authorization before Open Dental commit."
-            )
-            return {
-                "hitl_status": "PENDING_REVIEW",
-                "traces": state.traces + [t]
-            }
+    def _build_rep_call(self, s: RCMState) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        claim, st = _claim(s), s["payer_stats"]
+        item = {
+            "type": Route.REP_CALL,
+            "summary": s["triage"]["reason"],
+            "call_script": [
+                f"Reference: {st['zero_pay_lines']} of {st['lines']} lines zero-paid in {st['window_days']} days.",
+                "Ask whether a configuration/fee-schedule load or credentialing issue is affecting our TINs.",
+                "Request a reprocessing project for all affected claims instead of individual appeals.",
+                f"Log the call reference number on claim {claim.claim_id} and on the payer record.",
+            ],
+        }
+        return {"work_item": item, "traces": [_trace("build_rep_call", t0, f"zero-pay {st['zero_pay_pct']}%")]}
 
-        # Register nodes
-        builder.add_node("SupervisorNode", supervisor_node_fn)
-        builder.add_node("ClinicalRAGWorker", clinical_rag_fn)
-        builder.add_node("AppealWriterWorker", appeal_writer_fn)
-        builder.add_node("ObservabilityHarness", ragas_eval_fn)
-        builder.add_node("HITLApprovalBarrier", hitl_barrier_fn)
+    def _build_no_appeal(self, s: RCMState) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        claim = _claim(s)
+        entry = PLAYBOOK.get(claim.carc) if claim.carc else None
+        item = {"type": Route.NO_APPEAL, "summary": s["triage"]["reason"],
+                "actions": list(entry.actions) if entry else ["Manual review."]}
+        return {"work_item": item, "traces": [_trace("build_no_appeal", t0, s["triage"]["reason"][:80])]}
 
-        # Edges & Conditional Routing
-        builder.add_edge(START, "SupervisorNode")
+    def _human_review(self, s: RCMState) -> Dict[str, Any]:
+        # interrupt() pauses the graph; the node re-runs on resume, so nothing before it has side effects.
+        payload = {
+            "route": s["route"],
+            "draft": s.get("draft"),
+            "verification": s.get("verification"),
+            "work_item": s.get("work_item"),
+            "error": s.get("review_error"),
+        }
+        decision = interrupt(payload)
+        return {"review": decision, "review_error": "",
+                "traces": [{"node": "human_review", "latency_ms": 0.0, "ts": datetime.now().strftime("%H:%M:%S"),
+                            "detail": f"{decision.get('action', '?').upper()} by {decision.get('reviewer') or 'unknown'}"}]}
 
-        def supervisor_router(state: RCMWorkflowState) -> str:
-            if state.cache_hit:
-                return "ObservabilityHarness"
-            return "ClinicalRAGWorker"
+    def _commit(self, s: RCMState) -> Dict[str, Any]:
+        t0 = time.perf_counter()
+        claim = _claim(s)
+        decision = s["review"]
+        reviewer = (decision.get("reviewer") or "").strip()
+        if not reviewer:
+            return {"review_error": "Reviewer name is required.", "status": "PENDING_REVIEW",
+                    "traces": [_trace("commit", t0, "Blocked: no reviewer")]}
 
-        builder.add_conditional_edges(
-            "SupervisorNode",
-            supervisor_router,
-            {
-                "ObservabilityHarness": "ObservabilityHarness",
-                "ClinicalRAGWorker": "ClinicalRAGWorker"
-            }
-        )
-        builder.add_edge("ClinicalRAGWorker", "AppealWriterWorker")
-        builder.add_edge("AppealWriterWorker", "ObservabilityHarness")
-        builder.add_edge("ObservabilityHarness", "HITLApprovalBarrier")
-        builder.add_edge("HITLApprovalBarrier", END)
+        if s["route"] == Route.APPEAL:
+            text = decision.get("edited_text") or s["draft"]
+            v = self.verifier.verify(text, claim, _chart(s), s.get("evidence"), s.get("policy_chunks"))
+            if not v["passed"]:
+                msg = "; ".join(f"{x['type']}: {x['span']}" for x in v["violations"][:4])
+                return {"verification": v, "review_error": f"Edited letter failed verification - {msg}",
+                        "status": "PENDING_REVIEW", "traces": [_trace("commit", t0, "Blocked: edited text failed")]}
+            note = f"Appeal approved for {claim.primary_denied_proc.proc_code} " \
+                   f"(allowed ${claim.allowed_at_issue:,.2f}). Letter: {text[:60]}"
+        else:
+            note = s["work_item"]["summary"]
 
-        return builder
+        res = self.od.post_claim_tracking(claim.claim_id, s["route"], note, reviewer)
+        return {"status": "COMMITTED", "commit_result": res, "review_error": "",
+                "traces": [_trace("commit", t0, f"Open Dental -> {res['status']}")]}
 
-    def run(self, claim: DentalClaim, chart: Optional[ClinicalChart]) -> RCMWorkflowState:
-        """
-        Executes end-to-end multi-agent resolution using the compiled LangGraph StateGraph.
-        """
-        initial_state = RCMWorkflowState(
-            claim_id=claim.claim_id,
-            claim=claim,
-            clinical_chart=chart
-        )
-        result_dict = self.compiled_app.invoke(initial_state)
-        return RCMWorkflowState.model_validate(result_dict)
+    def _rejected(self, s: RCMState) -> Dict[str, Any]:
+        return {"status": "REJECTED", "traces": [{"node": "rejected", "latency_ms": 0.0,
+                                                  "ts": datetime.now().strftime("%H:%M:%S"),
+                                                  "detail": "Nothing written to Open Dental."}]}
 
-    def get_graph_mermaid(self) -> str:
-        """Returns Mermaid representation of the LangGraph StateGraph for visualization."""
-        return self.compiled_app.get_graph().draw_mermaid()
-
-
-# ==========================================
-# HITL Approval Barrier
-# ==========================================
-
-class HITLApproval:
-    """Enforces human-in-the-loop validation barrier before committing changes to Open Dental."""
+    # ------------------------------------------------------------------ routing
+    @staticmethod
+    def _after_triage(s: RCMState) -> str:
+        return {Route.APPEAL: "retrieve_policy", Route.RESUBMIT: "build_resubmission",
+                Route.REP_CALL: "build_rep_call"}.get(s["route"], "build_no_appeal")
 
     @staticmethod
-    def approve_and_commit(
-        state: RCMWorkflowState,
-        od_client: OpenDentalClient,
-        edited_appeal_text: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Commits human-approved appeal text into Open Dental eConnector claim tracking.
-        """
-        final_text = edited_appeal_text or state.appeal_letter or ""
-        commit_res = od_client.post_claim_tracking(
-            claim_id=state.claim_id,
-            appeal_text=final_text,
-            tracking_def_num=104
-        )
+    def _after_evidence(s: RCMState) -> str:
+        return "draft" if s["evidence"]["required_met"] else "documentation_gap"
 
-        state.hitl_status = "COMMITTED"
-        state.traces.append(ExecutionStepTrace(
-            step_id="STEP-6-COMMIT",
-            node_name="HITLApprovalBarrier",
-            action="Commit to Open Dental eConnector",
-            latency_ms=18.5,
-            input_tokens=0,
-            output_tokens=0,
-            cached=False,
-            status="COMMITTED",
-            details=f"Successfully written to Open Dental Claim ID {state.claim_id}. Status transitioned to 'AI Review Pending'. Audit trail recorded."
-        ))
+    @staticmethod
+    def _after_verify(s: RCMState) -> str:
+        if s["verification"]["passed"] or s.get("revision_count", 0) >= MAX_REVISIONS:
+            return "human_review"
+        return "draft"
 
-        return commit_res
+    @staticmethod
+    def _after_review(s: RCMState) -> str:
+        return "commit" if s["review"].get("action") == "approve" else "rejected"
+
+    @staticmethod
+    def _after_commit(s: RCMState) -> str:
+        return END if s.get("status") == "COMMITTED" else "human_review"
+
+    def _build(self) -> StateGraph:
+        g = StateGraph(RCMState)
+        for name in ["triage", "retrieve_policy", "extract_evidence", "draft", "verify", "documentation_gap",
+                     "build_resubmission", "build_rep_call", "build_no_appeal", "human_review", "commit",
+                     "rejected"]:
+            g.add_node(name, getattr(self, f"_{name}"))
+        g.add_edge(START, "triage")
+        g.add_conditional_edges("triage", self._after_triage,
+                                ["retrieve_policy", "build_resubmission", "build_rep_call", "build_no_appeal"])
+        g.add_edge("retrieve_policy", "extract_evidence")
+        g.add_conditional_edges("extract_evidence", self._after_evidence, ["draft", "documentation_gap"])
+        g.add_edge("draft", "verify")
+        g.add_conditional_edges("verify", self._after_verify, ["draft", "human_review"])
+        for n in ["documentation_gap", "build_resubmission", "build_rep_call", "build_no_appeal"]:
+            g.add_edge(n, "human_review")
+        g.add_conditional_edges("human_review", self._after_review, ["commit", "rejected"])
+        g.add_conditional_edges("commit", self._after_commit, ["human_review", END])
+        g.add_edge("rejected", END)
+        return g
+
+    # ------------------------------------------------------------------ public API
+    @staticmethod
+    def thread_config(thread_id: str) -> Dict[str, Any]:
+        return {"configurable": {"thread_id": thread_id}}
+
+    def start(self, claim_id: int, thread_id: Optional[str] = None) -> Dict[str, Any]:
+        """Runs until the human-review interrupt. Returns the paused state."""
+        claim = self.od.get_claim(claim_id)
+        if claim is None:
+            raise ValueError(f"Claim {claim_id} not found.")
+        chart = self.od.get_clinical_chart(claim_id)
+        tid = thread_id or f"claim-{claim_id}-{time.time_ns()}"
+        cfg = self.thread_config(tid)
+        self.graph.invoke({"claim": claim.model_dump(), "chart": chart.model_dump() if chart else None,
+                           "status": "PENDING_REVIEW", "traces": [], "usage": []}, cfg)
+        return {"thread_id": tid, **self.get_state(tid)}
+
+    def resume(self, thread_id: str, action: str, reviewer: str, edited_text: Optional[str] = None) -> Dict[str, Any]:
+        if action not in ("approve", "reject"):
+            raise ValueError("action must be 'approve' or 'reject'")
+        self.graph.invoke(Command(resume={"action": action, "reviewer": reviewer, "edited_text": edited_text}),
+                          self.thread_config(thread_id))
+        return {"thread_id": thread_id, **self.get_state(thread_id)}
+
+    def get_state(self, thread_id: str) -> Dict[str, Any]:
+        snap = self.graph.get_state(self.thread_config(thread_id))
+        values = dict(snap.values)
+        values["awaiting_review"] = bool(snap.next) and "human_review" in snap.next
+        return values
+
+    def mermaid(self) -> str:
+        return self.graph.get_graph().draw_mermaid()

@@ -1,331 +1,202 @@
 """
-eval/observability.py - RAGAS Evaluation Harness & LangSmith Execution Tracer
+eval/observability.py - Run ledger + golden evaluation suite.
 
-This module provides enterprise-grade observability and evaluation for Clove OS:
-1. RAGASEvaluator (RagasEvaluator):
-   - Faithfulness: Evaluates whether claims in drafted appeals are strictly grounded in
-     the patient's electronic health record (EHR) and clinical notes. Penalizes hallucinations.
-   - Context Precision: Measures the relevance and signal-to-noise ratio of retrieved
-     payer policy sections relative to the specific denial code and procedure.
-   - Answer Relevancy: Assesses how directly and comprehensively the drafted appeal
-     rebuts the insurer's remittance remark and denial justification.
-   - Hallucination Guardrail: Flags any appeal with faithfulness < 0.85 for mandatory
-     clinical director intervention.
+- RunLedger records ONLY real runs from this session (no synthetic history).
+  For hosted tracing, set LANGSMITH_TRACING=true and LANGSMITH_API_KEY; LangGraph
+  emits traces automatically when the `langsmith` package is installed.
+- run_golden_eval() executes the real agent against labelled cases and adversarial
+  fault injections, and reports measured metrics:
+    route accuracy, retrieval precision/recall vs gold chunks, claim-level faithfulness,
+    citation coverage, verifier catch rate, and HITL safety checks.
 
-2. LangSmithTracer:
-   - Tracks execution spans, latency per node, prompt/completion tokens, cache hit rates,
-     and financial savings across agent executions.
-   - Synthesizes realistic 100-run historical telemetry across Clove Dental's 100-clinic DSO.
-   - Exposes DataFrame utilities for interactive Streamlit dashboard analytics.
-
-HIPAA Compliance & Zero Data Retention Note:
-- Evaluation metrics operate strictly on in-memory representations.
-- Synthetic telemetry anonymizes patient identifiers into synthetic hashes.
+CLI:  python -m eval.observability
 """
 
+from __future__ import annotations
+
 import time
-import math
-import random
-import re
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
 import pandas as pd
-from pydantic import BaseModel, Field
 
-from integrations.mock_apis import DentalClaim, ClinicalChart
-
-
-# ==========================================
-# Pydantic Schemas for Evaluation & Tracing
-# ==========================================
-
-class RAGASMetrics(BaseModel):
-    faithfulness: float = Field(ge=0.0, le=1.0)
-    context_precision: float = Field(ge=0.0, le=1.0)
-    answer_relevancy: float = Field(ge=0.0, le=1.0)
-    harmonic_composite: float = Field(ge=0.0, le=1.0)
-    hallucination_detected: bool = False
-    grounded_evidence_count: int = 0
-    flagged_assertions: List[str] = Field(default_factory=list)
-    reasoning: str
-
-
-# Backward-compatible alias
-RagasMetricScore = RAGASMetrics
-
-
-class TelemetryRunRecord(BaseModel):
-    run_id: str
-    timestamp: str
-    clinic_name: str
-    payer_name: str
-    claim_id: int
-    cdt_code: str
-    denial_code: str
-    latency_ms: float
-    input_tokens: int
-    output_tokens: int
-    cached_prefix_tokens: int
-    cache_hit: bool
-    faithfulness_score: float
-    context_precision: float
-    answer_relevancy: float
-    status: str  # "PASSED_GUARD", "COMMITTED", "FLAGGED_REVIEW"
-
-
-# Backward-compatible alias
-TelemetrySpan = TelemetryRunRecord
+from agents.llm import DraftResult, TemplateDrafter
+from agents.rcm_supervisor import RCMDenialAgent
+from eval.grounding import GroundingVerifier
+from integrations.mock_apis import OpenDentalClient
+from knowledge.rcm_reference import Route
 
 
 # ==========================================
-# RAGAS Evaluation Harness
+# Run ledger (real runs only)
 # ==========================================
 
-class RAGASEvaluator:
-    """
-    RAGAS-compliant automated evaluation harness.
-    Validates agent outputs against electronic health record ground truth.
-    """
-
-    def __init__(self, hallucination_threshold: float = 0.88):
-        self.hallucination_threshold = hallucination_threshold
-
-    @classmethod
-    def evaluate_appeal(
-        cls,
-        appeal_text: str,
-        claim: DentalClaim,
-        chart: Optional[ClinicalChart]
-    ) -> RAGASMetrics:
-        """
-        Computes Faithfulness, Context Precision, and Answer Relevancy scores.
-        Scans for clinical hallucinations (unsupported tooth numbers, fictitious diagnostic findings).
-        """
-        if not appeal_text or not chart:
-            return RAGASMetrics(
-                faithfulness=0.80,
-                context_precision=0.75,
-                answer_relevancy=0.80,
-                harmonic_composite=0.78,
-                hallucination_detected=False,
-                grounded_evidence_count=3,
-                flagged_assertions=["Baseline chart data provided."],
-                reasoning="Default baseline evaluation: basic chart data available."
-            )
-
-        chart_notes = chart.clinical_notes.lower()
-        appeal_lower = appeal_text.lower()
-
-        # Extract tooth numbers from appeal (e.g. #19, #30, #14, tooth 19)
-        appeal_teeth = set(re.findall(r"(?:tooth\s*#?|#)(\d{1,2})", appeal_lower))
-        chart_teeth = set(re.findall(r"(?:tooth\s*#?|#)(\d{1,2})", chart_notes))
-
-        # Check for hallucinated tooth references
-        hallucinated_teeth = appeal_teeth - chart_teeth if chart_teeth else set()
-        hallucination = len(hallucinated_teeth) > 0
-
-        # Check clinical evidence anchors
-        key_terms = ["fracture", "caries", "decay", "buildup", "periodontitis", "bone loss", "probing", "ferrule", "zirconia", "graft"]
-        grounded_count = 0
-        flagged = []
-        for term in key_terms:
-            if term in appeal_lower:
-                if term in chart_notes:
-                    grounded_count += 1
-                else:
-                    flagged.append(f"Term '{term}' cited in appeal but absent in doctor notes.")
-
-        total_analyzed = max(1, grounded_count + (1 if hallucination else 0))
-        faithfulness = round(max(0.70, min(0.99, (grounded_count / total_analyzed))), 3) if not hallucination else 0.72
-
-        # Context precision: does the appeal address the exact denial code?
-        denial_code = claim.denial_code.lower()
-        has_denial_focus = denial_code in appeal_lower
-        context_precision = 0.96 if has_denial_focus else 0.88
-
-        # Answer relevancy: does it demand prompt payment and ADA compliance?
-        answer_relevancy = 0.95 if "prompt payment" in appeal_lower or "prompt pay" in appeal_lower else 0.90
-
-        # Harmonic composite mean
-        harmonic = round(3.0 / ((1.0 / faithfulness) + (1.0 / context_precision) + (1.0 / answer_relevancy)), 3)
-
-        audit_msg = (
-            f"Verified {grounded_count} clinical assertions against doctor notes. "
-            f"Hallucination guard: {'PASSED (Zero unanchored claims)' if not hallucination else 'TRIGGERED (Unmatched tooth #' + str(hallucinated_teeth) + ')'}."
-        )
-
-        return RAGASMetrics(
-            faithfulness=faithfulness,
-            context_precision=context_precision,
-            answer_relevancy=answer_relevancy,
-            harmonic_composite=harmonic,
-            hallucination_detected=hallucination,
-            grounded_evidence_count=grounded_count,
-            flagged_assertions=flagged,
-            reasoning=audit_msg
-        )
-
-    def evaluate(
-        self,
-        claim: DentalClaim,
-        chart: Optional[ClinicalChart],
-        appeal_text: str,
-        policy_section: str = "Payer Clinical Guidelines"
-    ) -> RAGASMetrics:
-        """Instance method for evaluating claim appeals."""
-        return self.evaluate_appeal(appeal_text=appeal_text, claim=claim, chart=chart)
-
-
-# Backward-compatible alias
-RagasEvaluator = RAGASEvaluator
-
-
-# ==========================================
-# LangSmith Execution Tracer & Telemetry Hub
-# ==========================================
-
-class LangSmithTracer:
-    """
-    Simulates LangSmith trace storage and execution telemetry for Clove OS.
-    Maintains a rolling buffer of 100 execution runs across the 100-office rollup.
-    """
-
+class RunLedger:
     def __init__(self):
-        self._runs: List[TelemetryRunRecord] = []
-        self._seed_historical_runs(100)
+        self.rows: List[Dict[str, Any]] = []
 
-    def _seed_historical_runs(self, count: int = 100):
-        """Generates 100 historical execution runs mirroring live operations."""
-        clinics = [
-            "Clove Dental - Austin Downtown",
-            "Clove Dental - Dallas Metro",
-            "Clove Dental - Houston Galleria",
-            "Clove Dental - San Antonio North",
-            "Clove Dental - Denver Tech Center",
-            "Clove Dental - Phoenix Biltmore"
-        ]
-        payers = ["Delta Dental of Texas", "MetLife Dental", "Cigna Dental", "Guardian Life", "Aetna Dental"]
-        cdts = ["D2950", "D4341", "D2740", "D7953", "D6010", "D0150"]
-        denial_codes = ["CO-50", "CO-97", "CO-16"]
+    def log(self, state: Dict[str, Any]) -> None:
+        claim = state["claim"]
+        v = state.get("verification") or {}
+        usage = state.get("usage") or []
+        self.rows.insert(0, {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "claim_id": claim["claim_id"],
+            "payer": claim["payer_name"],
+            "route": state.get("route"),
+            "status": state.get("status"),
+            "llm_calls": len(usage),
+            "revisions": state.get("revision_count", 0),
+            "faithfulness": v.get("faithfulness"),
+            "violations": len(v.get("violations", [])) if v else None,
+            "cost_usd": round(sum(u.get("cost_usd", 0) for u in usage), 5),
+            "usage_source": usage[0]["source"] if usage else "-",
+            "latency_ms": round(sum(t.get("latency_ms", 0) for t in state.get("traces", [])), 1),
+        })
 
-        now = datetime.now()
+    def df(self) -> pd.DataFrame:
+        return pd.DataFrame(self.rows)
 
-        for i in range(count):
-            run_time = now - timedelta(hours=random.uniform(0.5, 168.0))
-            is_cache_hit = (random.random() < 0.68)  # 68% semantic / prefix cache hit rate
-            cdt = random.choice(cdts)
-            denial = random.choice(denial_codes)
-            clinic = random.choice(clinics)
-            payer = random.choice(payers)
 
-            if is_cache_hit:
-                latency = round(random.uniform(1.2, 4.8), 2)  # sub-5ms semantic cache
-                in_tok = 0
-                out_tok = 0
-                cached_tok = random.randint(2800, 3500)
-                faith = round(random.uniform(0.96, 0.99), 3)
-                prec = round(random.uniform(0.94, 0.98), 3)
-                rel = round(random.uniform(0.95, 0.99), 3)
-            else:
-                latency = round(random.uniform(320.0, 780.0), 2)
-                in_tok = random.randint(2400, 3800)
-                out_tok = random.randint(550, 750)
-                cached_tok = random.randint(0, 1500)
-                faith = round(random.uniform(0.91, 0.97), 3)
-                prec = round(random.uniform(0.89, 0.95), 3)
-                rel = round(random.uniform(0.92, 0.97), 3)
+# ==========================================
+# Golden set
+# ==========================================
 
-            self._runs.append(TelemetryRunRecord(
-                run_id=f"TR-{1000 + i}",
-                timestamp=run_time.strftime("%Y-%m-%d %H:%M:%S"),
-                clinic_name=clinic,
-                payer_name=payer,
-                claim_id=90000 + i,
-                cdt_code=cdt,
-                denial_code=denial,
-                latency_ms=latency,
-                input_tokens=in_tok,
-                output_tokens=out_tok,
-                cached_prefix_tokens=cached_tok,
-                cache_hit=is_cache_hit,
-                faithfulness_score=faith,
-                context_precision=prec,
-                answer_relevancy=rel,
-                status="PASSED_GUARD" if faith >= 0.90 else "FLAGGED_REVIEW"
-            ))
+GOLDEN_ROUTES: Dict[int, str] = {
+    90412: Route.APPEAL,
+    90415: Route.RESUBMIT,
+    90422: Route.APPEAL,
+    90428: Route.APPEAL,
+    90431: Route.DOC_GAP,
+    90437: Route.REP_CALL,
+    90440: Route.NO_APPEAL,
+}
 
-        # Sort descending by timestamp
-        self._runs.sort(key=lambda r: r.timestamp, reverse=True)
+# Policy chunks a human RCM lead labelled as relevant for each appeal.
+GOLDEN_CHUNKS: Dict[int, set] = {
+    90412: {"GEN-D2950-01", "GEN-D2950-02"},
+    90422: {"GEN-D2950-03", "GEN-D2950-02"},
+    90428: {"GEN-D7953-02", "GEN-D7953-01"},
+}
 
-    def log_run(self, record: TelemetryRunRecord):
-        """Prepends a new live execution run to the telemetry buffer."""
-        self._runs.insert(0, record)
-        if len(self._runs) > 100:
-            self._runs.pop()
 
-    def log_trace(self, record: TelemetryRunRecord):
-        """Alias for log_run."""
-        self.log_run(record)
+class FaultInjectingDrafter(TemplateDrafter):
+    """Simulates a misbehaving LLM: first draft contains a fabricated quote, a billed-fee demand
+    and a Prompt Pay citation. Proves the verify -> revise loop catches and repairs it."""
 
-    def get_runs(self, limit: int = 100) -> List[TelemetryRunRecord]:
-        """Returns the most recent runs up to limit."""
-        return self._runs[:limit]
+    name = "fault-injection"
 
-    def get_traces(self) -> List[TelemetryRunRecord]:
-        """Alias for get_runs."""
-        return self.get_runs()
+    def draft(self, ctx: Dict[str, Any]) -> DraftResult:
+        res = super().draft(ctx)
+        claim = ctx["claim"]
+        res.text += (
+            "\nChart note: \"Doctor confirmed over 80% of the tooth was missing and the crown would fail.\""
+            f"\nWe request remittance of ${claim.primary_denied_proc.fee_billed:,.2f} under the Texas Prompt Pay Act."
+            "\nThis meets Delta Dental Section 4B."
+        )
+        return res
 
-    def get_summary_stats(self) -> Dict[str, Any]:
-        """Calculates global metrics across the 100 test runs."""
-        if not self._runs:
-            return {
-                "total_runs": 0,
-                "avg_faithfulness": 94.2,
-                "avg_precision": 92.8,
-                "avg_relevancy": 95.1,
-                "cache_hit_rate": 68.0,
-                "guard_pass_rate": 99.0
-            }
 
-        total = len(self._runs)
-        avg_faith = sum(r.faithfulness_score for r in self._runs) / total * 100.0
-        avg_prec = sum(r.context_precision for r in self._runs) / total * 100.0
-        avg_rel = sum(r.answer_relevancy for r in self._runs) / total * 100.0
-        cache_hits = sum(1 for r in self._runs if r.cache_hit)
-        passed = sum(1 for r in self._runs if r.status == "PASSED_GUARD")
+@dataclass
+class EvalReport:
+    metrics: Dict[str, Any]
+    cases: pd.DataFrame
+    checks: pd.DataFrame
 
-        return {
-            "total_runs": total,
-            "avg_faithfulness": round(avg_faith, 1),
-            "avg_precision": round(avg_prec, 1),
-            "avg_relevancy": round(avg_rel, 1),
-            "cache_hit_rate": round((cache_hits / total) * 100.0, 1),
-            "guard_pass_rate": round((passed / total) * 100.0, 1)
-        }
 
-    def get_aggregate_kpis(self) -> Dict[str, Any]:
-        """Alias for get_summary_stats."""
-        return self.get_summary_stats()
+def run_golden_eval(od_template: Optional[OpenDentalClient] = None) -> EvalReport:
+    od_template = od_template or OpenDentalClient()
+    rows, checks = [], []
 
-    def get_telemetry_df(self) -> pd.DataFrame:
-        """Returns telemetry traces formatted as a Pandas DataFrame for dashboard and evaluation."""
-        data = [
-            {
-                "Run ID": r.run_id,
-                "Timestamp": r.timestamp,
-                "Clinic": r.clinic_name,
-                "Payer": r.payer_name,
-                "Claim ID": r.claim_id,
-                "CDT": r.cdt_code,
-                "Denial": r.denial_code,
-                "Latency (ms)": r.latency_ms,
-                "Cache Status": "CACHE_HIT" if r.cache_hit else "CACHE_MISS",
-                "Faithfulness": f"{r.faithfulness_score * 100:.1f}%",
-                "Precision": f"{r.context_precision * 100:.1f}%",
-                "Relevancy": f"{r.answer_relevancy * 100:.1f}%",
-                "Guard Status": r.status
-            }
-            for r in self._runs
-        ]
-        return pd.DataFrame(data)
+    # 1. Labelled cases through the real agent
+    od = od_template.snapshot()
+    agent = RCMDenialAgent(od, drafter=TemplateDrafter())
+    for claim_id, expected in GOLDEN_ROUTES.items():
+        t0 = time.perf_counter()
+        s = agent.start(claim_id)
+        v = s.get("verification") or {}
+        retrieved = {c["id"] for c in s.get("policy_chunks", [])}
+        gold = GOLDEN_CHUNKS.get(claim_id)
+        rows.append({
+            "claim_id": claim_id,
+            "expected_route": expected,
+            "actual_route": s["route"],
+            "route_ok": s["route"] == expected,
+            "retrieval_precision": round(len(retrieved & gold) / len(retrieved), 2) if gold and retrieved else None,
+            "retrieval_recall": round(len(retrieved & gold) / len(gold), 2) if gold else None,
+            "faithfulness": v.get("faithfulness"),
+            "citation_coverage": v.get("citation_coverage"),
+            "verifier_passed": v.get("passed"),
+            "llm_calls": len(s.get("usage", [])),
+            "ms": round((time.perf_counter() - t0) * 1000, 1),
+        })
 
+    # 2. Adversarial: misbehaving drafter must be caught and repaired before review
+    od2 = od_template.snapshot()
+    bad = RCMDenialAgent(od2, drafter=FaultInjectingDrafter())
+    s = bad.start(90412)
+    first_fail = next((t for t in s["traces"] if t["node"] == "verify" and not t.get("passed", True)), None)
+    caught_types = set()
+    if first_fail:
+        # re-verify the injected draft directly to list what was caught
+        inj = FaultInjectingDrafter().draft(bad._ctx(s))
+        caught_types = {x["type"] for x in GroundingVerifier().verify(
+            inj.text, od2.get_claim(90412), od2.get_clinical_chart(90412), s["evidence"], s["policy_chunks"]
+        )["violations"]}
+    expected_types = {"FABRICATED_QUOTE", "UNSUPPORTED_MEASUREMENT", "BILLED_FEE_DEMAND",
+                      "MISAPPLIED_STATUTE", "UNVERIFIABLE_CITATION"}
+    checks.append({"check": "Verifier catches injected fabrication",
+                   "passed": expected_types <= caught_types,
+                   "detail": f"caught {sorted(caught_types)}"})
+    checks.append({"check": "Revise loop repairs draft before human review",
+                   "passed": bool(s["verification"]["passed"]) and s["revision_count"] >= 1,
+                   "detail": f"revisions={s['revision_count']}, final passed={s['verification']['passed']}"})
+
+    # 3. HITL safety
+    od3 = od_template.snapshot()
+    hitl = RCMDenialAgent(od3, drafter=TemplateDrafter())
+    s = hitl.start(90412)
+    checks.append({"check": "Graph pauses at human review (no auto-writeback)",
+                   "passed": s["awaiting_review"] and od3.get_claim(90412).status == "Denied",
+                   "detail": f"awaiting_review={s['awaiting_review']}"})
+    tampered = s["draft"] + "\nChart note: \"Patient reported severe pain for six months before the visit.\""
+    r = hitl.resume(s["thread_id"], "approve", "QA Reviewer", edited_text=tampered)
+    checks.append({"check": "Human-edited text is re-verified before writeback",
+                   "passed": r["awaiting_review"] and od3.get_claim(90412).status == "Denied",
+                   "detail": r.get("review_error", "")[:90]})
+    r = hitl.resume(s["thread_id"], "reject", "QA Reviewer")
+    checks.append({"check": "Reject writes nothing to Open Dental",
+                   "passed": r["status"] == "REJECTED" and not od3.get_claim(90412).tracking_notes,
+                   "detail": f"status={r['status']}"})
+    s = hitl.start(90412)
+    r = hitl.resume(s["thread_id"], "approve", "")
+    checks.append({"check": "Approval without a named reviewer is blocked",
+                   "passed": r["awaiting_review"] and od3.get_claim(90412).status == "Denied",
+                   "detail": r.get("review_error", "")})
+
+    cases = pd.DataFrame(rows)
+    chk = pd.DataFrame(checks)
+    appeals = cases[cases["faithfulness"].notna()]
+    metrics = {
+        "cases": len(cases),
+        "route_accuracy": round(cases["route_ok"].mean(), 3),
+        "retrieval_precision": round(cases["retrieval_precision"].dropna().mean(), 3),
+        "retrieval_recall": round(cases["retrieval_recall"].dropna().mean(), 3),
+        "faithfulness": round(appeals["faithfulness"].mean(), 3) if len(appeals) else None,
+        "citation_coverage": round(appeals["citation_coverage"].mean(), 3) if len(appeals) else None,
+        "llm_calls_per_denial": round(cases["llm_calls"].mean(), 2),
+        "safety_checks_passed": f"{int(chk['passed'].sum())}/{len(chk)}",
+    }
+    return EvalReport(metrics, cases, chk)
+
+
+if __name__ == "__main__":
+    rep = run_golden_eval()
+    pd.set_option("display.width", 200)
+    print(rep.cases.to_string(index=False))
+    print()
+    print(rep.checks.to_string(index=False))
+    print()
+    for k, v in rep.metrics.items():
+        print(f"{k:>24}: {v}")

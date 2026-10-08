@@ -1,39 +1,46 @@
 """
-integrations/mock_apis.py - Simulated Enterprise Connectors for Clove OS
+integrations/mock_apis.py - Simulated connectors for Clove OS (demo data, no real PHI).
 
-This module simulates the core external APIs used across Clove Dental's 100-office DSO:
-1. OpenDentalClient: Simulates Open Dental eConnector REST API for claims, procedure lines,
-   clinical charts (perio & operative notes), and claim tracking audit trails.
-2. DeputyClient: Simulates Deputy Workforce Management API for clinic rosters, timesheets,
-   and staffing deficit / overtime alerts.
-3. ZohoClient: Simulates Zoho CRM v8 API for Corp Dev M&A practice acquisition pipeline.
+1. OpenDentalClient - claims (line-level adjudication), clinical charts, payer denial stats,
+   claim-tracking writeback. Production: Open Dental API (eConnector/API Service).
+2. DeputyClient     - weekly timesheets + next-day demand. Alerts are COMPUTED from data
+   (FLSA weekly >40h for non-exempt staff; RDA:DDS and RDH capacity ratios).
+3. ZohoClient       - Corp Dev deal pipeline. Enrichment uses an explicit sample market table
+   (production sources noted per field) and a transparent, weighted scoring formula.
 
-HIPAA Compliance & Security Note:
-- In production, these connectors interface with a HIPAA-compliant BAA gateway (e.g., AWS Bedrock /
-  PrivateLink VPC endpoints).
-- All patient identifiers (Names, SSNs, DOBs) are tokenized or pseudo-anonymized prior to LLM ingress
-  under HIPAA Safe Harbor de-identification rules.
+All names, NPIs and IDs are synthetic.
 """
 
-from typing import Dict, List, Optional, Any
-from datetime import datetime, timedelta
-import random
+from __future__ import annotations
+
+import copy
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
 from pydantic import BaseModel, Field
+
+from knowledge.rcm_reference import CARC, parse_adjustment_code
 
 
 # ==========================================
-# Pydantic Schemas for Open Dental Entities
+# Open Dental entities
 # ==========================================
 
 class ClaimProc(BaseModel):
     proc_num: int
-    proc_code: str  # CDT code (e.g. D2950, D4341, D2740)
+    proc_code: str                      # CDT code
     proc_desc: str
     tooth_num: Optional[str] = None
     surf: Optional[str] = None
-    fee_billed: float
-    remittance_remark: str
-    denial_reason: str
+    fee_billed: float                   # office UCR fee
+    expected_allowed: float             # participating fee schedule amount
+    paid_amount: float = 0.0
+    adjustment_code: Optional[str] = None   # e.g. "CO-97" (None = paid as expected)
+    payer_remark: str = ""
+
+    @property
+    def is_denied(self) -> bool:
+        return self.adjustment_code is not None and self.paid_amount == 0.0
 
 
 class ClinicalChart(BaseModel):
@@ -48,8 +55,8 @@ class ClinicalChart(BaseModel):
     probing_depths: Optional[str] = None
     mobility_score: Optional[str] = None
     bone_loss_percentage: Optional[float] = None
-    radiograph_attached: bool = True
-    intraoral_photos_attached: bool = True
+    radiograph_attached: bool = False
+    intraoral_photos_attached: bool = False
 
 
 class DentalClaim(BaseModel):
@@ -60,670 +67,589 @@ class DentalClaim(BaseModel):
     clinic_name: str
     payer_id: str
     payer_name: str
+    plan_type: str = "unknown"          # "erisa_employer_group" | "non_erisa" | "unknown"
+    plan_funding: str = "unknown"       # "fully_insured" | "self_funded" | "unknown"
     date_of_service: str
-    status: str  # "Denied", "AI Review Pending", "Appealed", "Paid"
-    billed_fee: float
-    denial_code: str  # "CO-50", "CO-97", "CO-16"
-    denial_description: str
+    status: str                         # "Denied", "Appeal Pending Review", "Appealed", ...
     procs: List[ClaimProc] = Field(default_factory=list)
     tracking_notes: List[str] = Field(default_factory=list)
-    last_updated: str = Field(default_factory=lambda: datetime.now().isoformat())
+    last_updated: str = Field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+
+    # ---- derived views -------------------------------------------------
+    @property
+    def denied_procs(self) -> List[ClaimProc]:
+        return [p for p in self.procs if p.is_denied]
+
+    @property
+    def primary_denied_proc(self) -> Optional[ClaimProc]:
+        denied = self.denied_procs
+        return denied[0] if denied else None
+
+    @property
+    def denial_code(self) -> str:
+        p = self.primary_denied_proc
+        return p.adjustment_code if p and p.adjustment_code else ""
+
+    @property
+    def carc(self) -> str:
+        return parse_adjustment_code(self.denial_code)[1] if self.denial_code else ""
+
+    @property
+    def denial_description(self) -> str:
+        return CARC.get(self.carc, "Unknown adjustment reason")
+
+    @property
+    def billed_fee(self) -> float:
+        return round(sum(p.fee_billed for p in self.procs), 2)
+
+    @property
+    def allowed_at_issue(self) -> float:
+        """Contracted allowed amount on denied lines - the recoverable value, NOT billed fee."""
+        return round(sum(p.expected_allowed for p in self.denied_procs), 2)
 
 
 # ==========================================
-# Open Dental Client Simulation
+# Open Dental client (simulated)
 # ==========================================
+
+SRP_DESC = "Periodontal scaling and root planing - four or more teeth per quadrant"
+
+
+def _proc(num, code, desc, tooth, surf, billed, allowed, paid=0.0, adj=None, remark=""):
+    return ClaimProc(
+        proc_num=num, proc_code=code, proc_desc=desc, tooth_num=tooth, surf=surf,
+        fee_billed=billed, expected_allowed=allowed, paid_amount=paid,
+        adjustment_code=adj, payer_remark=remark,
+    )
+
 
 class OpenDentalClient:
-    """Simulates Open Dental eConnector REST API."""
+    """Simulated Open Dental API. Each instance owns an isolated copy of the seed data."""
+
+    TRACKING_STATUS_BY_ROUTE = {
+        "APPEAL": "Appeal Pending Submission",
+        "RESUBMIT_CORRECTED": "Corrected Claim Pending",
+        "REP_CALL": "Payer Rep Call Queued",
+        "DOCUMENTATION_GAP": "Provider Addendum Requested",
+        "NO_APPEAL": "Closed - No Appeal",
+    }
 
     def __init__(self):
         self._claims_db: Dict[int, DentalClaim] = {}
         self._charts_db: Dict[int, ClinicalChart] = {}
+        self._payer_stats: Dict[str, Dict[str, Any]] = {}
         self._seed_data()
 
+    # ------------------------------------------------------------------
     def _seed_data(self):
-        """Seeds realistic claim and chart records mirroring real-world dental practice data."""
-        seed_claims = [
-            {
-                "claim_id": 90412,
-                "patient_id": 10482,
-                "patient_name": "Eleanor Vance",
-                "clinic_id": 101,
-                "clinic_name": "Clove Dental - Austin Downtown",
-                "payer_id": "DELTADENTAL_TX",
-                "payer_name": "Delta Dental of Texas",
-                "date_of_service": "2026-09-18",
-                "status": "Denied",
-                "billed_fee": 385.00,
-                "denial_code": "CO-50",
-                "denial_description": "Non-covered service: Insufficient clinical documentation demonstrating medical necessity for core buildup separate from crown.",
-                "procs": [
-                    ClaimProc(
-                        proc_num=501,
-                        proc_code="D2950",
-                        proc_desc="Core buildup, including any pins when required",
-                        tooth_num="19",
-                        surf="MODBL",
-                        fee_billed=385.00,
-                        remittance_remark="Procedure lacks documentation of >=50% coronal tooth structure loss.",
-                        denial_reason="Payer Section 4B requires severe coronal breakdown documentation."
-                    )
-                ],
-                "chart": ClinicalChart(
-                    claim_id=90412,
-                    patient_id=10482,
-                    patient_name="Eleanor Vance",
-                    chart_date="2026-09-18",
-                    provider_name="Dr. Marcus Vance, DDS",
-                    provider_npi="1849204912",
+        seeds: List[Dict[str, Any]] = [
+            # 1. Classic necessity denial, chart fully supports -> APPEAL
+            dict(
+                claim=DentalClaim(
+                    claim_id=90412, patient_id=10482, patient_name="Eleanor Vance",
+                    clinic_id=101, clinic_name="Clove Dental - Austin Downtown",
+                    payer_id="DELTA_TX", payer_name="Delta Dental of Texas",
+                    plan_type="erisa_employer_group", plan_funding="fully_insured",
+                    date_of_service="2026-09-18", status="Denied",
+                    procs=[
+                        _proc(501, "D2950", "Core buildup, including any pins when required", "19", None,
+                              385.00, 212.00, adj="CO-50",
+                              remark="Documentation does not support necessity of buildup."),
+                    ],
+                ),
+                chart=ClinicalChart(
+                    claim_id=90412, patient_id=10482, patient_name="Eleanor Vance",
+                    chart_date="2026-09-18", provider_name="Dr. Marcus Hale, DDS", provider_npi="1000000011",
                     clinical_notes=(
                         "Tooth #19 presented with fractured disto-lingual cusp extending 2.5mm subgingivally. "
-                        "Pre-existing amalgam restoration failed with recurrent caries extending into pulp chamber floor. "
-                        "Excavation of extensive deep decay revealed residual coronal tooth structure breakdown measured at 65% "
-                        "loss of clinical crown. Endodontic obturation verified intact. Core buildup (D2950) placed using "
-                        "dual-cure composite resin with dual dentin bonding agent to provide essential retention, axial wall "
-                        "resistance form, and ferrule prior to full coverage crown preparation. Intraoral photos taken post-excavation."
+                        "Pre-existing amalgam restoration failed with recurrent caries. "
+                        "After excavation, approximately 65% of the clinical crown was lost. "
+                        "Core buildup placed with dual-cure composite to provide retention and resistance form "
+                        "and establish ferrule prior to crown preparation. "
+                        "Post-excavation intraoral photo and periapical radiograph taken."
                     ),
-                    decay_percentage=65.0,
-                    probing_depths="Tooth #19: MB 3mm, B 3mm, DB 4mm, ML 3mm, L 3mm, DL 5mm (subgingival margin)",
-                    mobility_score="Class 0",
-                    bone_loss_percentage=10.0,
-                    radiograph_attached=True,
-                    intraoral_photos_attached=True
-                )
-            },
-            {
-                "claim_id": 90415,
-                "patient_id": 11209,
-                "patient_name": "Marcus Aurelius Thorne",
-                "clinic_id": 104,
-                "clinic_name": "Clove Dental - Houston Galleria",
-                "payer_id": "METLIFE_DENTAL",
-                "payer_name": "MetLife Dental",
-                "date_of_service": "2026-09-21",
-                "status": "Denied",
-                "billed_fee": 620.00,
-                "denial_code": "CO-16",
-                "denial_description": "Claim lacks information: Missing comprehensive full-mouth periodontal charting showing probing depths >= 5mm and radiographically demonstrated bone loss.",
-                "procs": [
-                    ClaimProc(
-                        proc_num=502,
-                        proc_code="D4341",
-                        proc_desc="Periodontal scaling and root planing - four or more teeth per quadrant",
-                        tooth_num="Quad 1 (UR)",
-                        surf="Full Quad",
-                        fee_billed=310.00,
-                        remittance_remark="Missing active 6-point periodontal charting and diagnostic bitewings.",
-                        denial_reason="Lack of documented pocket depths >= 5mm."
-                    ),
-                    ClaimProc(
-                        proc_num=503,
-                        proc_code="D4341",
-                        proc_desc="Periodontal scaling and root planing - four or more teeth per quadrant",
-                        tooth_num="Quad 2 (UL)",
-                        surf="Full Quad",
-                        fee_billed=310.00,
-                        remittance_remark="Missing active 6-point periodontal charting and diagnostic bitewings.",
-                        denial_reason="Lack of documented pocket depths >= 5mm."
-                    )
-                ],
-                "chart": ClinicalChart(
-                    claim_id=90415,
-                    patient_id=11209,
-                    patient_name="Marcus Aurelius Thorne",
-                    chart_date="2026-09-21",
-                    provider_name="Dr. Sophia Chen, DMD",
-                    provider_npi="1928374610",
+                    decay_percentage=65.0, bone_loss_percentage=10.0,
+                    radiograph_attached=True, intraoral_photos_attached=True,
+                ),
+            ),
+            # 2. CO-16 (missing info) -> RESUBMIT, never appeal
+            dict(
+                claim=DentalClaim(
+                    claim_id=90415, patient_id=11209, patient_name="Marcus Thorne",
+                    clinic_id=104, clinic_name="Clove Dental - Houston Galleria",
+                    payer_id="METLIFE", payer_name="MetLife Dental",
+                    plan_type="erisa_employer_group", plan_funding="self_funded",
+                    date_of_service="2026-09-21", status="Denied",
+                    procs=[
+                        _proc(502, "D4341", SRP_DESC, "UR", None, 310.00, 178.00, adj="CO-16",
+                              remark="Periodontal charting not received."),
+                        _proc(503, "D4341", SRP_DESC, "UL", None, 310.00, 178.00, adj="CO-16",
+                              remark="Periodontal charting not received."),
+                    ],
+                ),
+                chart=ClinicalChart(
+                    claim_id=90415, patient_id=11209, patient_name="Marcus Thorne",
+                    chart_date="2026-09-21", provider_name="Dr. Sophia Chen, DMD", provider_npi="1000000029",
                     clinical_notes=(
-                        "Patient presented for initial periodontal therapy with generalized Stage III, Grade B periodontitis. "
-                        "Heavy tenacious subgingival calculus, spontaneous bleeding on probing (BOP) at 78% of sites. "
-                        "Quad 1 and Quad 2 demonstrated generalized pocket depths ranging from 5mm to 7mm on teeth #2, #3, #4, #5, "
-                        "#12, #13, #14, and #15 with 25-35% radiographic horizontal bone loss evident on vertical bitewings. "
-                        "Ultrasonic debridement and hand instrumentation performed under 2% Lidocaine 1:100k epi local anesthesia. "
-                        "Post-op instructions given. Chlorhexidine 0.12% rinse prescribed."
+                        "Generalized Stage III, Grade B periodontitis. "
+                        "Heavy subgingival calculus with bleeding on probing at 78% of sites. "
+                        "Pocket depths of 5mm to 7mm on teeth #2, #3, #4, #5, #12, #13, #14 and #15. "
+                        "Radiographs show 25-35% horizontal bone loss."
                     ),
-                    decay_percentage=15.0,
-                    probing_depths="Q1: #2 (6-4-6mm), #3 (7-5-6mm), #4 (5-4-5mm); Q2: #14 (7-5-7mm), #15 (6-5-6mm)",
-                    mobility_score="Class 1 on #3 and #14",
-                    bone_loss_percentage=30.0,
-                    radiograph_attached=True,
-                    intraoral_photos_attached=True
-                )
-            },
-            {
-                "claim_id": 90422,
-                "patient_id": 12844,
-                "patient_name": "Julian Delgado",
-                "clinic_id": 102,
-                "clinic_name": "Clove Dental - Dallas Metro",
-                "payer_id": "CIGNA_DENTAL",
-                "payer_name": "Cigna Health and Life Dental",
-                "date_of_service": "2026-09-24",
-                "status": "Denied",
-                "billed_fee": 1150.00,
-                "denial_code": "CO-97",
-                "denial_description": "Bundled code: The benefit for this service is included in the payment/allowance for another service already evaluated.",
-                "procs": [
-                    ClaimProc(
-                        proc_num=504,
-                        proc_code="D2740",
-                        proc_desc="Crown - porcelain/ceramic substrate",
-                        tooth_num="30",
-                        surf="Full",
-                        fee_billed=1150.00,
-                        remittance_remark="Crown preparation deemed bundled with recent endodontic access and restorative coverage.",
-                        denial_reason="Payer bundling policy regarding post-endo provisional restorations."
-                    )
-                ],
-                "chart": ClinicalChart(
-                    claim_id=90422,
-                    patient_id=12844,
-                    chart_date="2026-09-24",
-                    patient_name="Julian Delgado",
-                    provider_name="Dr. Sarah Jenkins, DDS",
-                    provider_npi="1726354891",
+                    probing_depths="#2 6-4-6, #3 7-5-6, #4 5-4-5, #5 5-4-5, #12 5-4-5, #13 6-5-5, #14 7-5-7, #15 6-5-6",
+                    bone_loss_percentage=30.0, radiograph_attached=True,
+                ),
+            ),
+            # 3. Buildup bundled into same-day crown (CO-97) -> unbundling APPEAL
+            dict(
+                claim=DentalClaim(
+                    claim_id=90422, patient_id=12844, patient_name="Julian Delgado",
+                    clinic_id=102, clinic_name="Clove Dental - Dallas Metro",
+                    payer_id="CIGNA", payer_name="Cigna Dental",
+                    plan_type="erisa_employer_group", plan_funding="self_funded",
+                    date_of_service="2026-09-24", status="Denied",
+                    procs=[
+                        _proc(504, "D2740", "Crown - porcelain/ceramic", "30", None,
+                              1150.00, 742.00, paid=371.00),
+                        _proc(505, "D2950", "Core buildup, including any pins when required", "30", None,
+                              385.00, 205.00, adj="CO-97",
+                              remark="Buildup is included in the allowance for the crown."),
+                    ],
+                ),
+                chart=ClinicalChart(
+                    claim_id=90422, patient_id=12844, patient_name="Julian Delgado",
+                    chart_date="2026-09-24", provider_name="Dr. Sarah Jenkins, DDS", provider_npi="1000000037",
                     clinical_notes=(
-                        "Tooth #30 underwent prior root canal therapy 6 months ago at external endodontic specialty practice. "
-                        "Patient presented with lost temporary composite and secondary cusp fracture of the mesio-lingual cusp. "
-                        "Structural integrity severely compromised with less than 2mm sound tooth structure remaining circumferentially. "
-                        "Provisional restoration was not placed by our office. Full coverage monolithic zirconia crown (D2740) "
-                        "is medically necessary to prevent catastrophic non-restorable vertical root fracture under masticatory forces. "
-                        "Final impression with polyether taken, margin supragingival buccal and equigingival lingual."
+                        "Tooth #30 had root canal therapy 6 months ago at an outside endodontic office. "
+                        "Patient presented with lost temporary and fracture of the mesio-lingual cusp. "
+                        "Less than 2mm of sound tooth structure remains circumferentially. "
+                        "Core buildup placed to provide retention and resistance form for the crown. "
+                        "Monolithic zirconia crown prepared; final impression taken. "
+                        "Pre-operative periapical radiograph on file."
                     ),
-                    decay_percentage=55.0,
-                    probing_depths="Tooth #30: 3mm all sites, no bleeding",
-                    mobility_score="Class 0",
-                    bone_loss_percentage=5.0,
-                    radiograph_attached=True,
-                    intraoral_photos_attached=True
-                )
-            },
-            {
-                "claim_id": 90428,
-                "patient_id": 13410,
-                "patient_name": "Amina Al-Mansoor",
-                "clinic_id": 108,
-                "clinic_name": "Clove Dental - San Antonio North",
-                "payer_id": "GUARDIAN_DENTAL",
-                "payer_name": "Guardian Life Dental",
-                "date_of_service": "2026-09-28",
-                "status": "Denied",
-                "billed_fee": 1450.00,
-                "denial_code": "CO-50",
-                "denial_description": "Non-covered service: Surgical guide (D6190) and bone graft (D7953) denied as incidental to implant placement (D6010).",
-                "procs": [
-                    ClaimProc(
-                        proc_num=505,
-                        proc_code="D7953",
-                        proc_desc="Bone replacement graft for ridge preservation - per site",
-                        tooth_num="14",
-                        surf="Ridge",
-                        fee_billed=450.00,
-                        remittance_remark="Deemed inclusive to surgical extraction.",
-                        denial_reason="Payer cross-coding bundle policy."
-                    ),
-                    ClaimProc(
-                        proc_num=506,
-                        proc_code="D6010",
-                        proc_desc="Surgical placement of implant body: endosteal implant",
-                        tooth_num="14",
-                        surf="Site",
-                        fee_billed=1000.00,
-                        remittance_remark="Primary procedure approved but ancillary graft bundle denied.",
-                        denial_reason="Denial of preservation graft line item."
-                    )
-                ],
-                "chart": ClinicalChart(
-                    claim_id=90428,
-                    patient_id=13410,
-                    patient_name="Amina Al-Mansoor",
-                    chart_date="2026-09-28",
-                    provider_name="Dr. Aaron Patel, DDS",
-                    provider_npi="1556273849",
+                    decay_percentage=55.0, radiograph_attached=True,
+                ),
+            ),
+            # 4. Ridge preservation bundled into extraction (CO-97), non-ERISA plan -> APPEAL
+            dict(
+                claim=DentalClaim(
+                    claim_id=90428, patient_id=13410, patient_name="Amina Rahman",
+                    clinic_id=108, clinic_name="Clove Dental - San Antonio North",
+                    payer_id="GUARDIAN", payer_name="Guardian Dental",
+                    plan_type="non_erisa", plan_funding="fully_insured",
+                    date_of_service="2026-09-28", status="Denied",
+                    procs=[
+                        _proc(506, "D7210", "Extraction, erupted tooth requiring removal of bone and/or sectioning",
+                              "14", None, 420.00, 238.00, paid=190.40),
+                        _proc(507, "D7953", "Bone replacement graft for ridge preservation - per site",
+                              "14", None, 450.00, 260.00, adj="CO-97",
+                              remark="Graft is inclusive to the extraction."),
+                    ],
+                ),
+                chart=ClinicalChart(
+                    claim_id=90428, patient_id=13410, patient_name="Amina Rahman",
+                    chart_date="2026-09-28", provider_name="Dr. Aaron Patel, DDS", provider_npi="1000000045",
                     clinical_notes=(
-                        "Patient presented with vertical root fracture on tooth #14 requiring atraumatic sectioning and extraction. "
-                        "Post-extraction buccal plate defect noted (Class II ridge deficiency). To allow for subsequent endosteal "
-                        "implant osseointegration and avoid sinus perforation, freeze-dried bone allograft (0.5cc FDBA) with "
-                        "resorbable collagen membrane was placed. This was an independent regenerative ridge preservation procedure, "
-                        "not incidental to routine extraction. CBCT cross-sectional scans confirm severe crestal height deficiency."
+                        "Vertical root fracture on tooth #14 required sectioning and atraumatic extraction. "
+                        "Post-extraction buccal plate defect noted. "
+                        "Freeze-dried bone allograft with resorbable collagen membrane placed for ridge preservation "
+                        "ahead of a planned implant. "
+                        "The graft was a separate regenerative procedure, not incidental to the extraction. "
+                        "CBCT confirms crestal height deficiency."
                     ),
-                    decay_percentage=40.0,
-                    probing_depths="Site #14: 8mm buccal sulcus pre-extraction at fracture line",
-                    mobility_score="Class 2 on #14 prior to extraction",
-                    bone_loss_percentage=45.0,
-                    radiograph_attached=True,
-                    intraoral_photos_attached=True
-                )
-            }
+                    bone_loss_percentage=45.0, radiograph_attached=True,
+                ),
+            ),
+            # 5. Chart contradicts the claim -> DOCUMENTATION_GAP (agent must refuse to appeal)
+            dict(
+                claim=DentalClaim(
+                    claim_id=90431, patient_id=13977, patient_name="Grace Okafor",
+                    clinic_id=101, clinic_name="Clove Dental - Austin Downtown",
+                    payer_id="DELTA_TX", payer_name="Delta Dental of Texas",
+                    plan_type="erisa_employer_group", plan_funding="fully_insured",
+                    date_of_service="2026-09-30", status="Denied",
+                    procs=[
+                        _proc(508, "D2950", "Core buildup, including any pins when required", "3", None,
+                              385.00, 212.00, adj="CO-50",
+                              remark="Documentation does not support necessity of buildup."),
+                    ],
+                ),
+                chart=ClinicalChart(
+                    claim_id=90431, patient_id=13977, patient_name="Grace Okafor",
+                    chart_date="2026-09-30", provider_name="Dr. Marcus Hale, DDS", provider_npi="1000000011",
+                    clinical_notes=(
+                        "Tooth #3 crown preparation completed. "
+                        "Composite placed to block out undercut on the mesial wall. "
+                        "Final impression taken."
+                    ),
+                    radiograph_attached=False,
+                ),
+            ),
+            # 6. Payer with systemic zero-pay pattern -> REP_CALL first
+            dict(
+                claim=DentalClaim(
+                    claim_id=90437, patient_id=14102, patient_name="Daniel Kim",
+                    clinic_id=104, clinic_name="Clove Dental - Houston Galleria",
+                    payer_id="AETNA", payer_name="Aetna Dental",
+                    plan_type="erisa_employer_group", plan_funding="fully_insured",
+                    date_of_service="2026-10-01", status="Denied",
+                    procs=[
+                        _proc(509, "D4910", "Periodontal maintenance", None, None,
+                              185.00, 112.00, adj="CO-50",
+                              remark="Service not medically necessary."),
+                    ],
+                ),
+                chart=ClinicalChart(
+                    claim_id=90437, patient_id=14102, patient_name="Daniel Kim",
+                    chart_date="2026-10-01", provider_name="Dr. Sophia Chen, DMD", provider_npi="1000000029",
+                    clinical_notes="Periodontal maintenance 3 months after SRP. Localized 4mm pockets, stable.",
+                ),
+            ),
+            # 7. Frequency limit (PR-119) -> NO_APPEAL
+            dict(
+                claim=DentalClaim(
+                    claim_id=90440, patient_id=14388, patient_name="Priya Natarajan",
+                    clinic_id=102, clinic_name="Clove Dental - Dallas Metro",
+                    payer_id="DELTA_TX", payer_name="Delta Dental of Texas",
+                    plan_type="erisa_employer_group", plan_funding="fully_insured",
+                    date_of_service="2026-10-02", status="Denied",
+                    procs=[
+                        _proc(510, "D1110", "Prophylaxis - adult", None, None, 125.00, 78.00, adj="PR-119",
+                              remark="Frequency limitation: 2 per benefit period."),
+                    ],
+                ),
+                chart=ClinicalChart(
+                    claim_id=90440, patient_id=14388, patient_name="Priya Natarajan",
+                    chart_date="2026-10-02", provider_name="Dr. Sarah Jenkins, DDS", provider_npi="1000000037",
+                    clinical_notes="Routine adult prophylaxis.",
+                ),
+            ),
         ]
-
-        for item in seed_claims:
-            claim_data = item.copy()
-            chart = claim_data.pop("chart")
-            claim = DentalClaim(**claim_data)
+        for s in seeds:
+            claim: DentalClaim = s["claim"]
             self._claims_db[claim.claim_id] = claim
-            self._charts_db[claim.claim_id] = chart
+            self._charts_db[claim.claim_id] = s["chart"]
 
+        # Trailing-90-day line stats per payer (what production's zero-pay detector computes).
+        self._payer_stats = {
+            "DELTA_TX": {"lines": 1840, "zero_pay_lines": 196},
+            "METLIFE":  {"lines": 1215, "zero_pay_lines": 141},
+            "CIGNA":    {"lines": 960,  "zero_pay_lines": 88},
+            "GUARDIAN": {"lines": 402,  "zero_pay_lines": 51},
+            "AETNA":    {"lines": 57,   "zero_pay_lines": 47},   # 82% -> systemic issue
+        }
+
+    # ------------------------------------------------------------------
     def get_claims(self, status: Optional[str] = "Denied") -> List[DentalClaim]:
-        """Returns claims filtered by status (default 'Denied')."""
+        claims = list(self._claims_db.values())
         if status is None:
-            return list(self._claims_db.values())
-        return [c for c in self._claims_db.values() if c.status.lower() == status.lower()]
+            return claims
+        return [c for c in claims if c.status.lower() == status.lower()]
 
     def get_claim(self, claim_id: int) -> Optional[DentalClaim]:
-        """Returns a single claim by claim ID."""
         return self._claims_db.get(claim_id)
 
     def get_claim_procs(self, claim_id: int) -> List[ClaimProc]:
-        """Returns specific CDT procedure lines and remittance remarks for a claim."""
         claim = self._claims_db.get(claim_id)
         return claim.procs if claim else []
 
     def get_clinical_chart(self, claim_id: int) -> Optional[ClinicalChart]:
-        """Returns clinical doctor notes and tooth surface decay logs."""
         return self._charts_db.get(claim_id)
 
-    def post_claim_tracking(self, claim_id: int, appeal_text: str, tracking_def_num: int = 104) -> Dict[str, Any]:
-        """
-        Commits drafted appeals back to Open Dental with status 'AI Review Pending'.
-        tracking_def_num 104 corresponds to 'AI RCM Appeal Submitted' definition in Open Dental.
-        """
+    def get_payer_denial_stats(self, payer_id: str) -> Dict[str, Any]:
+        s = self._payer_stats.get(payer_id, {"lines": 0, "zero_pay_lines": 0})
+        pct = (s["zero_pay_lines"] / s["lines"] * 100.0) if s["lines"] else 0.0
+        return {"payer_id": payer_id, "window_days": 90, **s, "zero_pay_pct": round(pct, 1)}
+
+    def post_claim_tracking(self, claim_id: int, route: str, note: str, reviewer: str) -> Dict[str, Any]:
+        """Writes a human-approved tracking entry + status. Production: Open Dental ClaimTracking."""
         claim = self._claims_db.get(claim_id)
         if not claim:
-            raise ValueError(f"Claim ID {claim_id} not found in Open Dental database.")
+            raise ValueError(f"Claim {claim_id} not found in Open Dental.")
+        if not reviewer or not reviewer.strip():
+            raise ValueError("A named human reviewer is required for EHR writeback.")
+        status = self.TRACKING_STATUS_BY_ROUTE.get(route, "Under Review")
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"[{now}] {status} | approved by {reviewer.strip()} | {note[:140]}"
+        claim.tracking_notes.append(entry)
+        claim.status = status
+        claim.last_updated = now
+        return {"success": True, "claim_id": claim_id, "status": status, "timestamp": now, "audit_entry": entry}
 
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        audit_entry = f"[{now_str}] DefNum={tracking_def_num} Status='AI Review Pending': Appeal committed. Summary: {appeal_text[:120]}..."
-        claim.tracking_notes.append(audit_entry)
-        claim.status = "AI Review Pending"
-        claim.last_updated = now_str
-
-        return {
-            "success": True,
-            "claim_id": claim_id,
-            "status": "AI Review Pending",
-            "tracking_def_num": tracking_def_num,
-            "timestamp": now_str,
-            "audit_entry": audit_entry
-        }
+    def snapshot(self) -> "OpenDentalClient":
+        """Deep copy - lets eval runs mutate state without touching the UI's client."""
+        return copy.deepcopy(self)
 
 
 # ==========================================
-# Deputy Workforce Management Client
+# Deputy (workforce) - simulated
 # ==========================================
 
-class RosterEntry(BaseModel):
-    roster_id: int
+class Employee(BaseModel):
+    employee_id: int
+    name: str
     clinic_id: int
     clinic_name: str
-    employee_id: int
-    employee_name: str
-    role: str  # "Doctor", "Lead Hygienist (RDH)", "Dental Assistant (RDA)", "Front Desk"
-    shift_start: str
-    shift_end: str
-    scheduled_hours: float
-    actual_hours: float
+    role: str                     # "DDS", "RDH", "RDA", "Front Desk"
+    flsa_exempt: bool             # doctors are typically exempt (salary/production)
     hourly_rate: float
+    hours_week_to_date: float
+    scheduled_remaining_hours: float
+
+    @property
+    def projected_week_hours(self) -> float:
+        return round(self.hours_week_to_date + self.scheduled_remaining_hours, 2)
+
+
+class ClinicDemand(BaseModel):
+    clinic_id: int
+    clinic_name: str
+    date: str
+    hygiene_appointments: int
+    restorative_procedures: int
+    rdh_scheduled: int
+    rda_scheduled: int
+    dds_scheduled: int
 
 
 class StaffingAlert(BaseModel):
     clinic_id: int
     clinic_name: str
-    alert_type: str  # "DEFICIT", "OVERTIME_RISK", "UNCOVERED_OPERATORY"
-    severity: str    # "HIGH", "CRITICAL", "MODERATE"
+    alert_type: str               # "OVERTIME_RISK" | "RDH_CAPACITY" | "RDA_RATIO"
+    severity: str                 # "HIGH" | "MODERATE"
     description: str
     action_required: str
+    est_cost_impact_usd: float = 0.0
 
 
 class DeputyClient:
-    """Simulates Deputy Workforce Management API for Clove Dental rollup."""
+    """Simulated Deputy API. Thresholds are explicit and configurable."""
+
+    FLSA_WEEKLY_OT_HOURS = 40.0     # federal FLSA; TX has no daily OT (CA would differ)
+    OT_PREMIUM = 0.5                # the extra half on top of straight time
+    RDH_APPTS_PER_DAY = 8
+    TARGET_RDA_PER_DDS = 2.0
+    RESTORATIVE_PROCS_PER_DDS_DAY = 8   # above this, a DDS needs the 2nd assistant
 
     def __init__(self):
-        self._seed_workforce()
-
-    def _seed_workforce(self):
-        self._rosters: List[RosterEntry] = [
-            RosterEntry(
-                roster_id=1001,
-                clinic_id=101,
-                clinic_name="Clove Dental - Austin Downtown",
-                employee_id=201,
-                employee_name="Dr. Marcus Vance, DDS",
-                role="Doctor",
-                shift_start="07:30 AM",
-                shift_end="04:30 PM",
-                scheduled_hours=8.0,
-                actual_hours=9.5,
-                hourly_rate=145.0
-            ),
-            RosterEntry(
-                roster_id=1002,
-                clinic_id=101,
-                clinic_name="Clove Dental - Austin Downtown",
-                employee_id=202,
-                employee_name="Rachel Evans, RDH",
-                role="Lead Hygienist (RDH)",
-                shift_start="08:00 AM",
-                shift_end="05:00 PM",
-                scheduled_hours=8.0,
-                actual_hours=8.0,
-                hourly_rate=52.0
-            ),
-            RosterEntry(
-                roster_id=1003,
-                clinic_id=101,
-                clinic_name="Clove Dental - Austin Downtown",
-                employee_id=203,
-                employee_name="Tyler Ross, RDA",
-                role="Dental Assistant (RDA)",
-                shift_start="07:30 AM",
-                shift_end="04:00 PM",
-                scheduled_hours=8.0,
-                actual_hours=10.0,
-                hourly_rate=28.0
-            ),
-            RosterEntry(
-                roster_id=1004,
-                clinic_id=104,
-                clinic_name="Clove Dental - Houston Galleria",
-                employee_id=204,
-                employee_name="Dr. Sophia Chen, DMD",
-                role="Doctor",
-                shift_start="08:00 AM",
-                shift_end="05:00 PM",
-                scheduled_hours=8.0,
-                actual_hours=8.5,
-                hourly_rate=150.0
-            ),
-            RosterEntry(
-                roster_id=1005,
-                clinic_id=104,
-                clinic_name="Clove Dental - Houston Galleria",
-                employee_id=205,
-                employee_name="David Miller, RDH",
-                role="Lead Hygienist (RDH)",
-                shift_start="08:00 AM",
-                shift_end="05:00 PM",
-                scheduled_hours=8.0,
-                actual_hours=7.5,
-                hourly_rate=54.0
-            ),
-            RosterEntry(
-                roster_id=1006,
-                clinic_id=102,
-                clinic_name="Clove Dental - Dallas Metro",
-                employee_id=206,
-                employee_name="Dr. Sarah Jenkins, DDS",
-                role="Doctor",
-                shift_start="08:00 AM",
-                shift_end="04:30 PM",
-                scheduled_hours=8.0,
-                actual_hours=8.0,
-                hourly_rate=140.0
-            ),
-            RosterEntry(
-                roster_id=1007,
-                clinic_id=108,
-                clinic_name="Clove Dental - San Antonio North",
-                employee_id=207,
-                employee_name="Dr. Aaron Patel, DDS",
-                role="Doctor",
-                shift_start="08:00 AM",
-                shift_end="05:00 PM",
-                scheduled_hours=8.0,
-                actual_hours=9.0,
-                hourly_rate=145.0
-            ),
-            RosterEntry(
-                roster_id=1008,
-                clinic_id=108,
-                clinic_name="Clove Dental - San Antonio North",
-                employee_id=208,
-                employee_name="Carla Gomez, RDA",
-                role="Dental Assistant (RDA)",
-                shift_start="07:45 AM",
-                shift_end="04:15 PM",
-                scheduled_hours=8.0,
-                actual_hours=10.5,
-                hourly_rate=29.0
-            )
+        e = lambda *a: Employee(**dict(zip(Employee.model_fields.keys(), a)))  # noqa: E731
+        self._employees: List[Employee] = [
+            e(201, "Dr. Marcus Hale", 101, "Clove Dental - Austin Downtown", "DDS", True, 0.0, 38.0, 9.0),
+            e(202, "Rachel Evans", 101, "Clove Dental - Austin Downtown", "RDH", False, 52.0, 32.0, 8.0),
+            e(203, "Tyler Ross", 101, "Clove Dental - Austin Downtown", "RDA", False, 28.0, 39.5, 9.0),
+            e(204, "Dr. Sophia Chen", 104, "Clove Dental - Houston Galleria", "DDS", True, 0.0, 34.0, 8.0),
+            e(205, "David Miller", 104, "Clove Dental - Houston Galleria", "RDH", False, 54.0, 30.0, 8.0),
+            e(206, "Lena Ortiz", 104, "Clove Dental - Houston Galleria", "RDA", False, 27.0, 33.0, 8.0),
+            e(207, "Dr. Aaron Patel", 108, "Clove Dental - San Antonio North", "DDS", True, 0.0, 36.0, 9.0),
+            e(208, "Carla Gomez", 108, "Clove Dental - San Antonio North", "RDA", False, 29.0, 36.2, 8.0),
+            e(209, "Ben Carter", 108, "Clove Dental - San Antonio North", "RDA", False, 26.0, 24.0, 8.0),
+        ]
+        self._demand: List[ClinicDemand] = [
+            ClinicDemand(clinic_id=101, clinic_name="Clove Dental - Austin Downtown", date="tomorrow",
+                         hygiene_appointments=11, restorative_procedures=7,
+                         rdh_scheduled=1, rda_scheduled=1, dds_scheduled=1),
+            ClinicDemand(clinic_id=104, clinic_name="Clove Dental - Houston Galleria", date="tomorrow",
+                         hygiene_appointments=7, restorative_procedures=14,
+                         rdh_scheduled=1, rda_scheduled=1, dds_scheduled=1),
+            ClinicDemand(clinic_id=108, clinic_name="Clove Dental - San Antonio North", date="tomorrow",
+                         hygiene_appointments=0, restorative_procedures=9,
+                         rdh_scheduled=0, rda_scheduled=2, dds_scheduled=1),
         ]
 
-    def get_rosters(self) -> List[RosterEntry]:
-        """Returns current staff rosters across active dental clinics."""
-        return self._rosters
+    def get_employees(self) -> List[Employee]:
+        return list(self._employees)
+
+    def get_rosters(self) -> List[Employee]:
+        return self.get_employees()
 
     def get_timesheets(self) -> List[Dict[str, Any]]:
-        """Returns summarized timesheets with overtime calculation."""
-        timesheets = []
-        for r in self._rosters:
-            ot_hours = max(0.0, r.actual_hours - r.scheduled_hours)
-            timesheets.append({
-                "employee_id": r.employee_id,
-                "employee_name": r.employee_name,
-                "clinic_name": r.clinic_name,
-                "role": r.role,
-                "scheduled_hours": r.scheduled_hours,
-                "actual_hours": r.actual_hours,
-                "overtime_hours": ot_hours,
-                "estimated_shift_cost": round(r.actual_hours * r.hourly_rate + ot_hours * r.hourly_rate * 0.5, 2)
+        rows = []
+        for emp in self._employees:
+            ot = 0.0 if emp.flsa_exempt else max(0.0, emp.projected_week_hours - self.FLSA_WEEKLY_OT_HOURS)
+            rows.append({
+                "employee": emp.name,
+                "clinic": emp.clinic_name,
+                "role": emp.role,
+                "flsa_exempt": emp.flsa_exempt,
+                "hours_week_to_date": emp.hours_week_to_date,
+                "projected_week_hours": emp.projected_week_hours,
+                "projected_ot_hours": round(ot, 2),
+                "ot_premium_usd": round(ot * emp.hourly_rate * self.OT_PREMIUM, 2),
             })
-        return timesheets
+        return rows
 
     def get_staffing_deficit_alerts(self) -> List[StaffingAlert]:
-        """Identifies clinic staffing shortages vs. appointment volume and overtime violations."""
-        alerts = [
-            StaffingAlert(
-                clinic_id=101,
-                clinic_name="Clove Dental - Austin Downtown",
-                alert_type="DEFICIT",
-                severity="CRITICAL",
-                description="Operatory #4 (Periodontal hygiene recall) scheduled with 11 patients but lacks assigned RDH. Rachel Evans at capacity.",
-                action_required="Dispatch per-diem float hygienist from South Austin hub or convert 3 cleanings to prophy assist."
-            ),
-            StaffingAlert(
-                clinic_id=101,
-                clinic_name="Clove Dental - Austin Downtown",
-                alert_type="OVERTIME_RISK",
-                severity="HIGH",
-                description="Tyler Ross (RDA) has accumulated 48.5 hours this pay period (8.5 hrs OT, projected +$350 payroll drag).",
-                action_required="Cap shift at 16:00 and assign evening sterilization run to float technician."
-            ),
-            StaffingAlert(
-                clinic_id=108,
-                clinic_name="Clove Dental - San Antonio North",
-                alert_type="OVERTIME_RISK",
-                severity="MODERATE",
-                description="Carla Gomez (RDA) is trending at 44.2 hours; surgeon running 45 min behind on implant placements.",
-                action_required="Rebalance operatory turnover tasks with front desk cross-trained staff."
-            ),
-            StaffingAlert(
-                clinic_id=104,
-                clinic_name="Clove Dental - Houston Galleria",
-                alert_type="UNCOVERED_OPERATORY",
-                severity="MODERATE",
-                description="Dr. Chen booked 14 restorative procedures tomorrow; only 1 RDA scheduled. Ideal ratio is 2 RDA:1 DDS.",
-                action_required="Authorize second assistant shift from Houston Central float pool."
-            )
-        ]
+        alerts: List[StaffingAlert] = []
+
+        for emp in self._employees:
+            if emp.flsa_exempt:
+                continue
+            proj = emp.projected_week_hours
+            if proj > self.FLSA_WEEKLY_OT_HOURS:
+                ot = proj - self.FLSA_WEEKLY_OT_HOURS
+                cost = round(ot * emp.hourly_rate * self.OT_PREMIUM, 2)
+                cap = max(0.0, self.FLSA_WEEKLY_OT_HOURS - emp.hours_week_to_date)
+                alerts.append(StaffingAlert(
+                    clinic_id=emp.clinic_id, clinic_name=emp.clinic_name, alert_type="OVERTIME_RISK",
+                    severity="HIGH" if ot >= 4 else "MODERATE",
+                    description=f"{emp.name} ({emp.role}) projected at {proj:.1f}h this week "
+                                f"({ot:.1f}h over FLSA 40h).",
+                    action_required=f"Cap remaining scheduled hours at {cap:.1f}h or cover with float staff.",
+                    est_cost_impact_usd=cost,
+                ))
+
+        for d in self._demand:
+            rdh_needed = -(-d.hygiene_appointments // self.RDH_APPTS_PER_DAY) if d.hygiene_appointments else 0
+            if rdh_needed > d.rdh_scheduled:
+                short = rdh_needed - d.rdh_scheduled
+                alerts.append(StaffingAlert(
+                    clinic_id=d.clinic_id, clinic_name=d.clinic_name, alert_type="RDH_CAPACITY",
+                    severity="HIGH",
+                    description=f"{d.hygiene_appointments} hygiene appointments vs capacity "
+                                f"{d.rdh_scheduled * self.RDH_APPTS_PER_DAY} ({d.rdh_scheduled} RDH).",
+                    action_required=f"Offer {short} float RDH shift(s) or reschedule "
+                                    f"{d.hygiene_appointments - d.rdh_scheduled * self.RDH_APPTS_PER_DAY} appointments.",
+                ))
+            if d.restorative_procedures > self.RESTORATIVE_PROCS_PER_DDS_DAY * d.dds_scheduled:
+                rda_needed = int(self.TARGET_RDA_PER_DDS * d.dds_scheduled)
+                if d.rda_scheduled < rda_needed:
+                    alerts.append(StaffingAlert(
+                        clinic_id=d.clinic_id, clinic_name=d.clinic_name, alert_type="RDA_RATIO",
+                        severity="MODERATE",
+                        description=f"{d.restorative_procedures} restorative procedures with "
+                                    f"{d.rda_scheduled} RDA : {d.dds_scheduled} DDS (target "
+                                    f"{self.TARGET_RDA_PER_DDS:.0f}:1).",
+                        action_required=f"Add {rda_needed - d.rda_scheduled} RDA shift(s) from float pool.",
+                    ))
         return alerts
+
+    def draft_shift_offer(self, alert: StaffingAlert) -> Dict[str, Any]:
+        """Dry-run payload (illustrative shape) - nothing is sent."""
+        return {
+            "dry_run": True,
+            "target": "Deputy roster API (open shift / shift offer)",
+            "payload": {
+                "location_id": alert.clinic_id,
+                "reason": alert.alert_type,
+                "note": alert.action_required,
+                "requires_manager_approval": True,
+            },
+        }
 
 
 # ==========================================
-# Zoho CRM v8 Client Simulation
+# Zoho CRM (Corp Dev) - simulated
 # ==========================================
 
 class ZohoDeal(BaseModel):
     id: str
     deal_name: str
-    stage: str  # "Identified", "LOI Signed", "Due Diligence", "Enriched & Ready"
-    practice_type: str  # "General Dentistry", "Pediatric / Ortho", "Multi-Specialty"
+    stage: str
+    practice_type: str
     location: str
     operatory_count: int
     ttm_revenue: float
     adjusted_ebitda: float
     patient_count: int
     payer_mix_ppo_pct: float
-    enrichment_status: str
+    enrichment_status: str = "Pending"
     median_hhi: Optional[float] = None
     dentists_per_10k: Optional[float] = None
     population_growth_5yr: Optional[float] = None
-    dso_synergy_score: Optional[float] = None
+    fit_score: Optional[float] = None
+    score_breakdown: Optional[Dict[str, float]] = None
     enrichment_notes: Optional[str] = None
 
 
+# Sample market data. Production sources:
+#   median_hhi           - US Census ACS 5-year, table B19013 (by ZCTA/place)
+#   dentists_per_10k     - NPPES NPI registry (taxonomy 1223*) / population
+#   population_growth_5yr- ACS 5-year population estimates
+SAMPLE_MARKET_DATA: Dict[str, Dict[str, float]] = {
+    "Round Rock, TX":     {"median_hhi": 98_000, "dentists_per_10k": 5.1, "population_growth_5yr": 14.0},
+    "Plano, TX":          {"median_hhi": 112_000, "dentists_per_10k": 7.9, "population_growth_5yr": 4.5},
+    "Sugar Land, TX":     {"median_hhi": 125_000, "dentists_per_10k": 7.2, "population_growth_5yr": 6.0},
+    "Westlake Hills, TX": {"median_hhi": 210_000, "dentists_per_10k": 9.5, "population_growth_5yr": 3.0},
+}
+
+
 class ZohoClient:
-    """Simulates Zoho CRM v8 API for M&A target acquisition and demographic enrichment."""
+    """Simulated Zoho CRM. Fit score = transparent weighted blend (0-10), weights shown in UI."""
+
+    SCORE_WEIGHTS = {"ebitda_margin": 0.35, "growth": 0.25, "low_competition": 0.20, "ppo_mix": 0.20}
 
     def __init__(self):
-        self._deals: Dict[str, ZohoDeal] = {}
-        self._seed_deals()
-
-    def _seed_deals(self):
-        deals_data = [
-            ZohoDeal(
-                id="ZH-8819",
-                deal_name="Apex Family Dental Care",
-                stage="Due Diligence",
-                practice_type="General Dentistry",
-                location="Round Rock, TX",
-                operatory_count=6,
-                ttm_revenue=2450000.0,
-                adjusted_ebitda=680000.0,
-                patient_count=4200,
-                payer_mix_ppo_pct=78.0,
-                enrichment_status="Pending",
-                median_hhi=None,
-                dentists_per_10k=None,
-                population_growth_5yr=None,
-                dso_synergy_score=None,
-                enrichment_notes=None
-            ),
-            ZohoDeal(
-                id="ZH-8824",
-                deal_name="Lakeview Dental Group",
-                stage="LOI Signed",
-                practice_type="Multi-Specialty",
-                location="Plano, TX",
-                operatory_count=9,
-                ttm_revenue=3900000.0,
-                adjusted_ebitda=1120000.0,
-                patient_count=6800,
-                payer_mix_ppo_pct=85.0,
-                enrichment_status="Pending",
-                median_hhi=None,
-                dentists_per_10k=None,
-                population_growth_5yr=None,
-                dso_synergy_score=None,
-                enrichment_notes=None
-            ),
-            ZohoDeal(
-                id="ZH-8831",
-                deal_name="Sugar Land Pediatric & Ortho",
-                stage="Identified",
-                practice_type="Pediatric / Ortho",
-                location="Sugar Land, TX",
-                operatory_count=7,
-                ttm_revenue=2800000.0,
-                adjusted_ebitda=740000.0,
-                patient_count=4900,
-                payer_mix_ppo_pct=72.0,
-                enrichment_status="Pending",
-                median_hhi=None,
-                dentists_per_10k=None,
-                population_growth_5yr=None,
-                dso_synergy_score=None,
-                enrichment_notes=None
-            ),
-            ZohoDeal(
-                id="ZH-8799",
-                deal_name="Barton Creek Premier Smiles",
-                stage="Enriched & Ready",
-                practice_type="General Dentistry",
-                location="Westlake Hills, TX",
-                operatory_count=8,
-                ttm_revenue=3400000.0,
-                adjusted_ebitda=990000.0,
-                patient_count=5100,
-                payer_mix_ppo_pct=65.0,
-                enrichment_status="Enriched",
-                median_hhi=142000.0,
-                dentists_per_10k=5.4,
-                population_growth_5yr=8.2,
-                dso_synergy_score=9.4,
-                enrichment_notes="High-wealth demographic with favorable PPO out-of-network margin. Fast tuck-in target."
-            )
-        ]
-        for d in deals_data:
-            self._deals[d.id] = d
+        self._deals: Dict[str, ZohoDeal] = {
+            d.id: d for d in [
+                ZohoDeal(id="ZH-8819", deal_name="Apex Family Dental Care", stage="Due Diligence",
+                         practice_type="General Dentistry", location="Round Rock, TX", operatory_count=6,
+                         ttm_revenue=2_450_000, adjusted_ebitda=680_000, patient_count=4200, payer_mix_ppo_pct=78),
+                ZohoDeal(id="ZH-8824", deal_name="Lakeview Dental Group", stage="LOI Signed",
+                         practice_type="Multi-Specialty", location="Plano, TX", operatory_count=9,
+                         ttm_revenue=3_900_000, adjusted_ebitda=1_120_000, patient_count=6800, payer_mix_ppo_pct=85),
+                ZohoDeal(id="ZH-8831", deal_name="Sugar Land Pediatric & Ortho", stage="Identified",
+                         practice_type="Pediatric / Ortho", location="Sugar Land, TX", operatory_count=7,
+                         ttm_revenue=2_800_000, adjusted_ebitda=740_000, patient_count=4900, payer_mix_ppo_pct=72),
+                ZohoDeal(id="ZH-8799", deal_name="Barton Creek Premier Smiles", stage="Identified",
+                         practice_type="General Dentistry", location="Westlake Hills, TX", operatory_count=8,
+                         ttm_revenue=3_400_000, adjusted_ebitda=990_000, patient_count=5100, payer_mix_ppo_pct=65),
+            ]
+        }
 
     def get_deals(self) -> List[ZohoDeal]:
-        """Returns deals pipeline from Zoho CRM."""
         return list(self._deals.values())
 
     def get_deal(self, deal_id: str) -> Optional[ZohoDeal]:
-        """Returns a single deal by ID."""
         return self._deals.get(deal_id)
 
+    @classmethod
+    def score(cls, deal: ZohoDeal, market: Dict[str, float]) -> Dict[str, float]:
+        """Each component normalised to 0-10, then weighted. Pure function, unit-testable."""
+        clamp = lambda x: max(0.0, min(10.0, x))  # noqa: E731
+        margin = deal.adjusted_ebitda / deal.ttm_revenue if deal.ttm_revenue else 0.0
+        parts = {
+            "ebitda_margin": clamp((margin - 0.15) / 0.20 * 10),          # 15% -> 0, 35% -> 10
+            "growth": clamp(market["population_growth_5yr"] / 15 * 10),   # 15%+ -> 10
+            "low_competition": clamp((10 - market["dentists_per_10k"]) / 6 * 10),  # 4/10k -> 10, 10/10k -> 0
+            "ppo_mix": clamp((deal.payer_mix_ppo_pct - 50) / 40 * 10),    # 50% -> 0, 90% -> 10
+        }
+        parts = {k: round(v, 2) for k, v in parts.items()}
+        parts["total"] = round(sum(parts[k] * w for k, w in cls.SCORE_WEIGHTS.items()), 2)
+        return parts
+
     def enrich_deal(self, deal_id: str) -> ZohoDeal:
-        """
-        Enriches a deal by performing automated demographic, macroeconomic,
-        and DSO synergy scoring, then writing back to Zoho custom fields.
-        """
         deal = self._deals.get(deal_id)
         if not deal:
-            raise ValueError(f"Deal ID {deal_id} not found in Zoho CRM.")
-
-        # Deterministic enrichment values based on location & financials
-        base_hhi = 98000.0 + (hash(deal.location) % 45000)
-        dentists_ratio = round(4.2 + ((hash(deal.deal_name) % 30) / 10.0), 1)
-        growth_rate = round(6.5 + ((hash(deal.location) % 40) / 10.0), 1)
-        synergy = round(min(9.8, max(6.5, (deal.adjusted_ebitda / deal.ttm_revenue) * 25.0 + (growth_rate * 0.2))), 1)
-
-        deal.median_hhi = round(base_hhi, 2)
-        deal.dentists_per_10k = dentists_ratio
-        deal.population_growth_5yr = growth_rate
-        deal.dso_synergy_score = synergy
+            raise ValueError(f"Deal {deal_id} not found in Zoho CRM.")
+        market = SAMPLE_MARKET_DATA.get(deal.location)
+        if market is None:
+            deal.enrichment_status = "No market data"
+            deal.enrichment_notes = f"No market data for {deal.location}; manual research required."
+            return deal
+        breakdown = self.score(deal, market)
+        deal.median_hhi = market["median_hhi"]
+        deal.dentists_per_10k = market["dentists_per_10k"]
+        deal.population_growth_5yr = market["population_growth_5yr"]
+        deal.fit_score = breakdown["total"]
+        deal.score_breakdown = breakdown
         deal.enrichment_status = "Enriched"
-        deal.stage = "Enriched & Ready"
         deal.enrichment_notes = (
-            f"Automated AI Scan Completed: Median HHI ${deal.median_hhi:,.0f}, "
-            f"Provider Density {deal.dentists_per_10k} dentists/10k pop, "
-            f"5-Year Pop Growth {deal.population_growth_5yr}%. "
-            f"Estimated EBITDA multiple expansion: +1.8x post-Clove centralized procurement & RCM rollup."
+            f"EBITDA margin {deal.adjusted_ebitda / deal.ttm_revenue:.0%}, "
+            f"{market['dentists_per_10k']} dentists/10k, 5-yr growth {market['population_growth_5yr']}%. "
+            f"Fit score {breakdown['total']}/10 (sample market data)."
         )
-
         return deal
 
-    def post_deal_enrichment(
-        self,
-        deal_id: str,
-        median_hhi: float,
-        dentists_per_10k: float,
-        population_growth_5yr: float,
-        dso_synergy_score: float,
-        notes: Optional[str] = None
-    ) -> ZohoDeal:
-        """Writes demographic scan and synergy evaluation results directly to Zoho deal fields."""
-        deal = self._deals.get(deal_id)
-        if not deal:
-            raise ValueError(f"Deal ID {deal_id} not found in Zoho CRM.")
-
-        deal.median_hhi = median_hhi
-        deal.dentists_per_10k = dentists_per_10k
-        deal.population_growth_5yr = population_growth_5yr
-        deal.dso_synergy_score = dso_synergy_score
-        deal.enrichment_status = "Enriched"
-        deal.stage = "Enriched & Ready"
-        if notes:
-            deal.enrichment_notes = notes
-
-        return deal
-
-    def post_deal(self, deal_data: Dict[str, Any]) -> ZohoDeal:
-        """Creates or updates a deal in Zoho CRM."""
-        deal = ZohoDeal(**deal_data)
-        self._deals[deal.id] = deal
-        return deal
-
+    def writeback_payload(self, deal: ZohoDeal) -> Dict[str, Any]:
+        """Dry-run Zoho CRM update payload (custom field API names are illustrative)."""
+        return {
+            "dry_run": True,
+            "method": "PUT", "path": "/crm/v8/Deals",
+            "body": {"data": [{
+                "id": deal.id,
+                "Median_HHI": deal.median_hhi,
+                "Dentists_per_10k": deal.dentists_per_10k,
+                "Pop_Growth_5yr": deal.population_growth_5yr,
+                "Fit_Score": deal.fit_score,
+            }]},
+        }
