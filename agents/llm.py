@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from cache.token_optimizer import PrefixCacheSimulator
+from llm_cache.token_optimizer import PrefixCacheSimulator
 from integrations.mock_apis import ClinicalChart, DentalClaim
 from knowledge.rcm_reference import CARC, CDT, PLAYBOOK, POLICY_CORPUS
 

@@ -34,7 +34,7 @@ from langgraph.types import Command, interrupt
 
 from agents.llm import TemplateDrafter, get_default_drafter
 from agents.retrieval import EvidenceExtractor, PolicyRetriever
-from cache.token_optimizer import PolicyContextCache, PromptCacheEconomics
+from llm_cache.token_optimizer import PolicyContextCache, PromptCacheEconomics
 from eval.grounding import GroundingVerifier
 from integrations.mock_apis import ClinicalChart, DentalClaim, OpenDentalClient
 from knowledge.rcm_reference import (

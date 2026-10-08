@@ -1,5 +1,5 @@
 """
-app.py - Clove OS: AI operations console (prototype).
+app.py - Clove OS: AI operations console.
 
 Modules
 1. RCM Denial Queue   - triage -> retrieval -> evidence -> draft -> verify -> human review -> Open Dental
@@ -17,7 +17,7 @@ import streamlit as st
 
 from agents.llm import STATIC_PREFIX, AnthropicDrafter
 from agents.rcm_supervisor import RCMDenialAgent
-from cache.token_optimizer import PolicyContextCache, PromptCacheEconomics, break_even_reads, estimate_tokens
+from llm_cache.token_optimizer import PolicyContextCache, PromptCacheEconomics, break_even_reads, estimate_tokens
 from eval.observability import RunLedger, run_golden_eval
 from integrations.mock_apis import DeputyClient, OpenDentalClient, ZohoClient
 from knowledge.rcm_reference import Route
@@ -26,26 +26,71 @@ st.set_page_config(page_title="Clove OS | Dental AI Operations", page_icon="🦷
 
 st.markdown("""
 <style>
-  .stApp { background:#0B1120; color:#F8FAFC; }
-  .hdr { background:linear-gradient(135deg,#0F172A 0%,#1E293B 55%,#0F2D37 100%); border:1px solid #1E3A5F;
-         border-radius:12px; padding:20px 26px; margin-bottom:18px; }
-  .hdr h1 { font-size:26px; font-weight:800; margin:0; color:#fff; letter-spacing:-.4px; }
-  .hdr p { color:#94A3B8; margin:4px 0 0 0; font-size:13.5px; }
-  .kpis { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:18px; }
-  .kpi { background:#111827; border:1px solid #1F2937; border-radius:10px; padding:14px 18px; transition:.15s; }
-  .kpi:hover { border-color:#0D9488; transform:translateY(-2px); }
-  .kpi .l { font-size:11px; font-weight:700; letter-spacing:.8px; text-transform:uppercase; color:#64748B; }
-  .kpi .v { font-size:24px; font-weight:800; color:#38BDF8; margin-top:4px; }
-  .kpi .s { font-size:12px; color:#10B981; margin-top:2px; }
-  .pill { display:inline-block; padding:3px 10px; border-radius:999px; font-size:11px; font-weight:700; }
-  .p-red { background:rgba(239,68,68,.18); color:#F87171; border:1px solid rgba(239,68,68,.4); }
-  .p-amb { background:rgba(245,158,11,.18); color:#FBBF24; border:1px solid rgba(245,158,11,.4); }
-  .p-grn { background:rgba(16,185,129,.18); color:#34D399; border:1px solid rgba(16,185,129,.4); }
-  .p-blu { background:rgba(14,165,233,.18); color:#38BDF8; border:1px solid rgba(14,165,233,.4); }
-  .card { background:#111827; border:1px solid #1F2937; border-radius:8px; padding:14px 16px; margin:8px 0; font-size:13px; color:#CBD5E1; }
-  .step { background:#0F172A; border-left:4px solid #0D9488; border-radius:6px; padding:8px 14px; margin-bottom:6px;
-          font-family:ui-monospace,Menlo,monospace; font-size:12.5px; }
-  .step.warn { border-left-color:#F59E0B; } .step.bad { border-left-color:#EF4444; }
+  /* Header */
+  .hdr { 
+    background: linear-gradient(135deg, rgba(30, 41, 59, 0.8) 0%, rgba(15, 23, 42, 0.9) 100%);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px; 
+    padding: 24px 32px; 
+    margin-bottom: 24px;
+  }
+  .hdr h1 { 
+    font-size: 30px; 
+    font-weight: 800; 
+    margin: 0; 
+    color: #F8FAFC;
+    letter-spacing: -0.5px; 
+  }
+  .hdr p { color: #94A3B8; margin: 8px 0 0 0; font-size: 15px; font-weight: 500; }
+  
+  /* KPIs */
+  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+  .kpi { 
+    background: rgba(30, 41, 59, 0.5); 
+    border: 1px solid rgba(255, 255, 255, 0.08); 
+    border-radius: 10px; 
+    padding: 16px 20px; 
+    transition: all 0.2s;
+  }
+  .kpi:hover { 
+    border-color: #38BDF8; 
+    transform: translateY(-2px); 
+  }
+  .kpi .l { font-size: 11.5px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: #94A3B8; margin-bottom: 4px; }
+  .kpi .v { font-size: 26px; font-weight: 800; color: #F8FAFC; margin: 4px 0; }
+  .kpi .s { font-size: 13px; color: #10B981; font-weight: 500; }
+  
+  /* Pills */
+  .pill { display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .p-red { background: rgba(239, 68, 68, 0.2); color: #FCA5A5; border: 1px solid rgba(239, 68, 68, 0.3); }
+  .p-amb { background: rgba(245, 158, 11, 0.2); color: #FCD34D; border: 1px solid rgba(245, 158, 11, 0.3); }
+  .p-grn { background: rgba(16, 185, 129, 0.2); color: #6EE7B7; border: 1px solid rgba(16, 185, 129, 0.3); }
+  .p-blu { background: rgba(14, 165, 233, 0.2); color: #7DD3FC; border: 1px solid rgba(14, 165, 233, 0.3); }
+  
+  /* Cards */
+  .card { 
+    background: rgba(30, 41, 59, 0.5); 
+    border: 1px solid rgba(255, 255, 255, 0.08); 
+    border-radius: 10px; 
+    padding: 18px 20px; 
+    margin: 12px 0; 
+    font-size: 14px; 
+    color: #E2E8F0; 
+  }
+  
+  /* Steps */
+  .step { 
+    background: rgba(15, 23, 42, 0.5); 
+    border-left: 4px solid #14B8A6; 
+    border-radius: 8px; 
+    padding: 10px 16px; 
+    margin-bottom: 8px;
+    font-family: monospace; 
+    font-size: 13px; 
+    color: #CBD5E1;
+  }
+  .step.warn { border-left-color: #F59E0B; } 
+  .step.bad { border-left-color: #EF4444; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -79,7 +124,7 @@ LIVE = isinstance(agent.drafter, AnthropicDrafter)
 # ==========================================
 with st.sidebar:
     st.markdown("### 🦷 CLOVE OS")
-    st.caption("AI operations console · prototype")
+    st.caption("AI operations console · v1.0")
     st.markdown(
         f"<span class='pill {'p-grn' if LIVE else 'p-blu'}'>Drafting: "
         f"{'Claude (live, ' + agent.drafter.model + ')' if LIVE else 'Offline deterministic'}</span> "
@@ -96,10 +141,22 @@ with st.sidebar:
         f"- Cost: `${es['cost_usd']:.4f}` · saved `${es['saved_usd']:.4f}`\n"
         f"- Retrieval cache hit rate: `{ss.rcache.stats()['hit_rate_pct']}%`")
 
-st.markdown("""<div class="hdr"><h1>Clove OS — Denial Resolution & Ops Agents</h1>
-<p>Works the RCM denial queue that the Underpayments module hands off: triage first, LLM only where a letter is warranted,
-every claim verified against the chart, nothing written to Open Dental without a named reviewer.</p></div>""",
-            unsafe_allow_html=True)
+st.markdown("""<div class="hdr">
+  <div style="display:flex; justify-content:space-between; align-items:center;">
+    <div>
+      <h1>🦷 Clove OS — Denial Resolution & Ops Agents</h1>
+      <p style="color:#94A3B8; margin:8px 0 0 0; font-size:15px; font-weight:500;">
+        Works the RCM denial queue that the Underpayments module hands off: triage first, LLM only where a letter is warranted, 
+        every claim verified against the chart, nothing written to Open Dental without a named reviewer.
+      </p>
+    </div>
+    <div style="text-align:right;">
+      <span style="background:rgba(16, 185, 129, 0.15); color:#10B981; padding:6px 14px; border-radius:999px; font-weight:700; font-size:12px; border:1px solid rgba(16, 185, 129, 0.3); white-space:nowrap;">
+        SYSTEM ACTIVE
+      </span>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
 
 
 # ==========================================
