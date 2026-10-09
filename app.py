@@ -381,17 +381,13 @@ with st.sidebar:
         
     st.markdown("---")
     st.markdown("#### 📉 Session Economics")
-    st.markdown(
-        f"- LLM Invocations: `{es['calls']}`
-"
-        f"- Cache Reads / Writes: `{es['cache_reads']} / {es['cache_writes']}`
-"
-        f"- Cost Spent: `${es['cost_usd']:.4f}`
-"
-        f"- Net Savings: `${es['saved_usd']:.4f}`
-"
-        f"- Retrieval Cache Hit: `{ss.rcache.stats()['hit_rate_pct']}%`"
-    )
+    st.markdown(f"""
+- LLM Invocations: `{es['calls']}`
+- Cache Reads / Writes: `{es['cache_reads']} / {es['cache_writes']}`
+- Cost Spent: `${es['cost_usd']:.4f}`
+- Net Savings: `${es['saved_usd']:.4f}`
+- Retrieval Cache Hit: `{ss.rcache.stats()['hit_rate_pct']}%`
+""")
 
 # Execution Helpers
 def render_traces(traces):
@@ -570,9 +566,9 @@ if module == "RCM Denial Queue":
                 
                 with st.expander(f"📚 Retrieved Clinical Policy ({'Shared Cache Hit' if s.get('retrieval_cache_hit') else 'BM25 Exact Lexical Search'})"):
                     for ch in s["policy_chunks"]:
-                        st.markdown(f"**{ch['id']}** · Score `{ch['score']}` · *{ch['provenance']}*
+                        st.markdown(f"""**{ch['id']}** · Score `{ch['score']}` · *{ch['provenance']}*
 
-> {ch['text']}")
+> {ch['text']}""")
 
                 # Adversarial Verification Metric Strip
                 v = s["verification"]
@@ -585,10 +581,8 @@ if module == "RCM Denial Queue":
                 c4.metric("LLM Cost", f"${u.get('cost_usd', 0):.4f}", "Prefix cache read" if u.get("cache_read_input_tokens") else "Cache write")
                 
                 if v["violations"]:
-                    st.error("Adversarial Verifier Violations:
-" + "
-".join(
-                        f"- **{x['type']}** `{x['span']}` — {x['detail']}" for x in v["violations"]))
+                    v_msgs = [f"- **{x['type']}** `{x['span']}` — {x['detail']}" for x in v["violations"]]
+                    st.error("Adversarial Verifier Violations:\n" + "\n".join(v_msgs))
 
                 # Document Letter Canvas
                 st.markdown("""
@@ -618,8 +612,8 @@ if module == "RCM Denial Queue":
                                    ("call_script", "Representative Call Script")]:
                     if wi.get(key):
                         st.markdown(f"**{title}**")
-                        st.markdown("
-".join(f"- {x}" for x in wi[key]))
+                        wi_items = (f"- {x}" for x in wi[key])
+                        st.markdown("\n".join(wi_items))
                 edited = None
 
             if s.get("review_error"):
