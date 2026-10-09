@@ -26,71 +26,236 @@ st.set_page_config(page_title="Clove OS | Dental AI Operations", page_icon="🦷
 
 st.markdown("""
 <style>
-  /* Header */
+  @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+  /* Global typography and background */
+  html, body, [class*="css"], .stMarkdown {
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif !important;
+  }
+  code, pre, .mono {
+    font-family: 'JetBrains Mono', monospace !important;
+  }
+  
+  /* App background */
+  .stApp {
+    background-color: #0A0F1D;
+    color: #E2E8F0;
+  }
+  
+  /* Streamlit header hidden/clean */
+  header[data-testid="stHeader"] {
+    background-color: transparent !important;
+  }
+
+  /* Command Header Banner */
   .hdr { 
-    background: linear-gradient(135deg, rgba(30, 41, 59, 0.8) 0%, rgba(15, 23, 42, 0.9) 100%);
-    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: linear-gradient(180deg, #131E33 0%, #0F172A 100%);
+    border: 1px solid #1E293B;
     border-radius: 12px; 
-    padding: 24px 32px; 
-    margin-bottom: 24px;
+    padding: 20px 24px; 
+    margin-bottom: 22px;
+    box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.4);
+  }
+  .hdr-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
   }
   .hdr h1 { 
-    font-size: 30px; 
+    font-size: 22px; 
     font-weight: 800; 
     margin: 0; 
     color: #F8FAFC;
-    letter-spacing: -0.5px; 
+    letter-spacing: -0.02em; 
   }
-  .hdr p { color: #94A3B8; margin: 8px 0 0 0; font-size: 15px; font-weight: 500; }
+  .hdr p { 
+    color: #94A3B8; 
+    margin: 6px 0 0 0; 
+    font-size: 13.5px; 
+    font-weight: 450; 
+    line-height: 1.5;
+  }
+  .status-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    background: rgba(16, 185, 129, 0.08); 
+    color: #10B981; 
+    padding: 5px 12px; 
+    border-radius: 999px; 
+    font-weight: 700; 
+    font-size: 11px; 
+    letter-spacing: 0.05em;
+    border: 1px solid rgba(16, 185, 129, 0.25); 
+    white-space: nowrap;
+  }
+  .status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background-color: #10B981;
+    box-shadow: 0 0 8px #10B981;
+  }
   
-  /* KPIs */
-  .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+  /* High-Density KPI Grid */
+  .kpis { 
+    display: grid; 
+    grid-template-columns: repeat(4, 1fr); 
+    gap: 12px; 
+    margin-bottom: 22px; 
+  }
   .kpi { 
-    background: rgba(30, 41, 59, 0.5); 
-    border: 1px solid rgba(255, 255, 255, 0.08); 
-    border-radius: 10px; 
-    padding: 16px 20px; 
-    transition: all 0.2s;
+    background: #111827; 
+    border: 1px solid #1F2937; 
+    border-top: 3px solid #0891B2;
+    border-radius: 9px; 
+    padding: 14px 16px; 
+    transition: transform 0.15s ease, border-color 0.15s ease;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
   }
   .kpi:hover { 
     border-color: #38BDF8; 
     transform: translateY(-2px); 
   }
-  .kpi .l { font-size: 11.5px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: #94A3B8; margin-bottom: 4px; }
-  .kpi .v { font-size: 26px; font-weight: 800; color: #F8FAFC; margin: 4px 0; }
-  .kpi .s { font-size: 13px; color: #10B981; font-weight: 500; }
+  .kpi-red { border-top-color: #EF4444; }
+  .kpi-cyan { border-top-color: #06B6D4; }
+  .kpi-purple { border-top-color: #8B5CF6; }
+  .kpi-green { border-top-color: #10B981; }
   
-  /* Pills */
-  .pill { display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; }
-  .p-red { background: rgba(239, 68, 68, 0.2); color: #FCA5A5; border: 1px solid rgba(239, 68, 68, 0.3); }
-  .p-amb { background: rgba(245, 158, 11, 0.2); color: #FCD34D; border: 1px solid rgba(245, 158, 11, 0.3); }
-  .p-grn { background: rgba(16, 185, 129, 0.2); color: #6EE7B7; border: 1px solid rgba(16, 185, 129, 0.3); }
-  .p-blu { background: rgba(14, 165, 233, 0.2); color: #7DD3FC; border: 1px solid rgba(14, 165, 233, 0.3); }
-  
-  /* Cards */
-  .card { 
-    background: rgba(30, 41, 59, 0.5); 
-    border: 1px solid rgba(255, 255, 255, 0.08); 
-    border-radius: 10px; 
-    padding: 18px 20px; 
-    margin: 12px 0; 
-    font-size: 14px; 
-    color: #E2E8F0; 
+  .kpi .l { 
+    font-size: 10.5px; 
+    font-weight: 700; 
+    letter-spacing: 0.06em; 
+    text-transform: uppercase; 
+    color: #94A3B8; 
+    margin-bottom: 4px; 
+  }
+  .kpi .v { 
+    font-size: 24px; 
+    font-weight: 800; 
+    color: #F8FAFC; 
+    margin: 2px 0; 
+    letter-spacing: -0.02em;
+  }
+  .kpi .s { 
+    font-size: 11.5px; 
+    color: #64748B; 
+    font-weight: 500; 
   }
   
-  /* Steps */
-  .step { 
-    background: rgba(15, 23, 42, 0.5); 
-    border-left: 4px solid #14B8A6; 
-    border-radius: 8px; 
-    padding: 10px 16px; 
-    margin-bottom: 8px;
-    font-family: monospace; 
+  /* Status Badges & Pills */
+  .pill { 
+    display: inline-flex; 
+    align-items: center;
+    padding: 3px 9px; 
+    border-radius: 5px; 
+    font-size: 11px; 
+    font-weight: 700; 
+    letter-spacing: 0.02em;
+  }
+  .p-red { background: rgba(239, 68, 68, 0.12); color: #F87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+  .p-amb { background: rgba(245, 158, 11, 0.12); color: #FBBF24; border: 1px solid rgba(245, 158, 11, 0.3); }
+  .p-grn { background: rgba(16, 185, 129, 0.12); color: #34D399; border: 1px solid rgba(16, 185, 129, 0.3); }
+  .p-blu { background: rgba(8, 145, 178, 0.12); color: #38BDF8; border: 1px solid rgba(8, 145, 178, 0.3); }
+  
+  /* Cards & Surface Containers */
+  .card { 
+    background: #111827; 
+    border: 1px solid #1F2937; 
+    border-radius: 9px; 
+    padding: 14px 16px; 
+    margin: 8px 0; 
     font-size: 13px; 
+    color: #CBD5E1; 
+    line-height: 1.55;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+  }
+  
+  /* Execution Step Traces */
+  .step { 
+    background: #0B101E; 
+    border-left: 3px solid #0891B2; 
+    border-radius: 5px; 
+    padding: 8px 12px; 
+    margin-bottom: 5px;
+    font-family: 'JetBrains Mono', monospace; 
+    font-size: 11.5px; 
     color: #CBD5E1;
   }
   .step.warn { border-left-color: #F59E0B; } 
   .step.bad { border-left-color: #EF4444; }
+
+  /* Streamlit Button & Input Overrides */
+  div.stButton > button[kind="primary"] {
+    background: #059669 !important;
+    border: 1px solid #047857 !important;
+    color: #FFFFFF !important;
+    font-weight: 700 !important;
+    border-radius: 7px !important;
+    padding: 8px 18px !important;
+    font-size: 13px !important;
+    letter-spacing: 0.02em !important;
+    transition: all 0.15s ease !important;
+    box-shadow: 0 2px 6px rgba(5, 150, 105, 0.25) !important;
+  }
+  div.stButton > button[kind="primary"]:hover {
+    background: #10B981 !important;
+    border-color: #059669 !important;
+    transform: translateY(-1px) !important;
+    box-shadow: 0 4px 12px rgba(5, 150, 105, 0.35) !important;
+  }
+  div.stButton > button[kind="secondary"] {
+    background: #1E293B !important;
+    border: 1px solid #334155 !important;
+    color: #F1F5F9 !important;
+    border-radius: 7px !important;
+    font-size: 13px !important;
+    transition: all 0.15s ease !important;
+  }
+  div.stButton > button[kind="secondary"]:hover {
+    background: #334155 !important;
+    border-color: #64748B !important;
+  }
+
+  /* Metric Card Overrides */
+  [data-testid="stMetric"] {
+    background-color: #111827;
+    border: 1px solid #1F2937;
+    padding: 10px 12px;
+    border-radius: 8px;
+  }
+  [data-testid="stMetricLabel"] {
+    font-size: 10.5px !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    color: #94A3B8 !important;
+  }
+  [data-testid="stMetricValue"] {
+    font-size: 18px !important;
+    font-weight: 700 !important;
+    color: #F8FAFC !important;
+  }
+
+  /* Text Area & Input Styling */
+  .stTextArea textarea {
+    background-color: #0B101E !important;
+    border: 1px solid #1E293B !important;
+    border-radius: 7px !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 12px !important;
+    color: #E2E8F0 !important;
+    line-height: 1.5 !important;
+  }
+  .stTextArea textarea:focus {
+    border-color: #0891B2 !important;
+    box-shadow: 0 0 0 1px #0891B2 !important;
+  }
+  
+  /* Sidebar Styling */
+  [data-testid="stSidebar"] {
+    background-color: #090D17 !important;
+    border-right: 1px solid #1E293B !important;
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -142,17 +307,19 @@ with st.sidebar:
         f"- Retrieval cache hit rate: `{ss.rcache.stats()['hit_rate_pct']}%`")
 
 st.markdown("""<div class="hdr">
-  <div style="display:flex; justify-content:space-between; align-items:center;">
+  <div class="hdr-top">
     <div>
-      <h1>🦷 Clove OS — Denial Resolution & Ops Agents</h1>
-      <p style="color:#94A3B8; margin:8px 0 0 0; font-size:15px; font-weight:500;">
-        Works the RCM denial queue that the Underpayments module hands off: triage first, LLM only where a letter is warranted, 
-        every claim verified against the chart, nothing written to Open Dental without a named reviewer.
+      <div style="font-size:10.5px; font-weight:800; letter-spacing:0.08em; color:#0891B2; text-transform:uppercase; margin-bottom:2px;">CLOVE DENTAL DSO · OPERATIONS ENGINE</div>
+      <h1>🦷 Clove OS — Denial Resolution & Operational Agents</h1>
+      <p>
+        Autonomous triage, retrieval, and verifiable appeals for dental DSO operations. 
+        Zero LLM token spend on attachment denials (`CO-16`), adversarial clinical fact-checking, and auditable Open Dental writeback.
       </p>
     </div>
     <div style="text-align:right;">
-      <span style="background:rgba(16, 185, 129, 0.15); color:#10B981; padding:6px 14px; border-radius:999px; font-weight:700; font-size:12px; border:1px solid rgba(16, 185, 129, 0.3); white-space:nowrap;">
-        SYSTEM ACTIVE
+      <span class="status-tag">
+        <span class="status-dot"></span>
+        OPEN DENTAL eCONNECTOR LIVE
       </span>
     </div>
   </div>
@@ -188,10 +355,10 @@ if module == "RCM Denial Queue":
     open_claims = [c for c in claims if c.status == "Denied"]
     allowed_open = sum(c.allowed_at_issue for c in open_claims)
     st.markdown(f"""<div class="kpis">
-      <div class="kpi"><div class="l">Open denials</div><div class="v">{len(open_claims)}</div><div class="s">of {len(claims)} in queue</div></div>
-      <div class="kpi"><div class="l">Allowed $ at issue</div><div class="v">${allowed_open:,.0f}</div><div class="s">contracted, not billed</div></div>
-      <div class="kpi"><div class="l">LLM calls this session</div><div class="v">{es['calls']}</div><div class="s">triage runs before any LLM</div></div>
-      <div class="kpi"><div class="l">Session runs closed</div><div class="v">{len(ss.ledger.rows)}</div><div class="s">approved or rejected by a human</div></div>
+      <div class="kpi kpi-red"><div class="l">Open denials</div><div class="v">{len(open_claims)}</div><div class="s">of {len(claims)} in queue</div></div>
+      <div class="kpi kpi-cyan"><div class="l">Allowed $ at issue</div><div class="v">${allowed_open:,.0f}</div><div class="s">contracted, not billed</div></div>
+      <div class="kpi kpi-purple"><div class="l">LLM calls this session</div><div class="v">{es['calls']}</div><div class="s">triage runs before any LLM</div></div>
+      <div class="kpi kpi-green"><div class="l">Session runs closed</div><div class="v">{len(ss.ledger.rows)}</div><div class="s">approved or rejected by a human</div></div>
     </div>""", unsafe_allow_html=True)
 
     col_q, col_w = st.columns([1.05, 1.95])
